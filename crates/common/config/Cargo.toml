@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ethrex-p2p.workspace = true
+ethrex-p2p = { workspace = true, optional = true }
 ethrex-common.workspace = true
 serde_json.workspace = true
 keccak-hash.workspace = true
@@ -12,3 +12,7 @@ hex.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[features]
+default = ["network"]
+network = ["ethrex-p2p"]

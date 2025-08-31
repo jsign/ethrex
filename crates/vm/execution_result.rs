@@ -1,8 +1,13 @@
 use bytes::Bytes;
+#[cfg(feature = "revm")]
 use ethrex_common::Address;
-use ethrex_common::{H256, types::Log};
+use ethrex_common::types::Log;
+#[cfg(feature = "revm")]
+use ethrex_common::H256;
 use ethrex_levm::errors::{ExecutionReport as LevmExecutionReport, TxResult};
+#[cfg(feature = "revm")]
 use revm::primitives::ExecutionResult as RevmExecutionResult;
+#[cfg(feature = "revm")]
 use revm::primitives::result::Output as RevmOutput;
 
 #[derive(Debug)]
@@ -56,6 +61,7 @@ impl ExecutionResult {
     }
 }
 
+#[cfg(feature = "revm")]
 impl From<RevmExecutionResult> for ExecutionResult {
     fn from(val: RevmExecutionResult) -> Self {
         match val {

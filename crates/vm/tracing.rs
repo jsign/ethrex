@@ -2,7 +2,9 @@ use ethrex_common::tracing::CallTrace;
 use ethrex_common::types::Block;
 
 use crate::backends::levm::LEVM;
-use crate::{Evm, EvmError, backends::revm::REVM};
+#[cfg(feature = "revm")]
+use crate::backends::revm::REVM;
+use crate::{Evm, EvmError};
 
 impl Evm {
     /// Runs a single tx with the call tracer and outputs its trace
@@ -25,6 +27,7 @@ impl Evm {
             ))?;
 
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => {
                 REVM::trace_tx_calls(&block.header, tx, state, only_top_call, with_log)
             }
@@ -44,6 +47,7 @@ impl Evm {
         stop_index: Option<usize>,
     ) -> Result<(), EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => REVM::rerun_block(block, state, stop_index),
             Evm::LEVM { db, vm_type } => LEVM::rerun_block(db, block, stop_index, *vm_type),
         }

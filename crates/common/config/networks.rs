@@ -1,3 +1,4 @@
+#[cfg(feature = "network")]
 use ethrex_p2p::types::Node;
 use std::{
     fmt::{self},
@@ -98,6 +99,7 @@ impl Network {
         }
     }
 
+    #[cfg(feature = "network")]
     pub fn get_bootnodes(&self) -> Vec<Node> {
         let bootnodes = match self {
             Network::PublicNetwork(PublicNetwork::Holesky) => HOLESKY_BOOTNODES,

@@ -1,5 +1,32 @@
 use ethrex_common::types::{ChainConfig, Fork};
+
+#[cfg(feature = "revm")]
 pub use revm::primitives::SpecId;
+
+#[cfg(not(feature = "revm"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpecId {
+    FRONTIER = 0,
+    FRONTIER_THAWING = 1,
+    HOMESTEAD = 2,
+    DAO_FORK = 3,
+    TANGERINE = 4,
+    SPURIOUS_DRAGON = 5,
+    BYZANTIUM = 6,
+    CONSTANTINOPLE = 7,
+    PETERSBURG = 8,
+    ISTANBUL = 9,
+    MUIR_GLACIER = 10,
+    BERLIN = 11,
+    LONDON = 12,
+    ARROW_GLACIER = 13,
+    GRAY_GLACIER = 14,
+    MERGE = 15,
+    SHANGHAI = 16,
+    CANCUN = 17,
+    PRAGUE = 18,
+    OSAKA = 19,
+}
 
 /// Returns the spec id according to the block timestamp and the stored chain config
 /// WARNING: Assumes at least Merge fork is active
@@ -34,6 +61,7 @@ pub fn fork_to_spec_id(fork: Fork) -> SpecId {
 
 use ethrex_common::Address;
 
+#[cfg(feature = "revm")]
 pub fn create_contract_address(from: Address, nonce: u64) -> Address {
     Address::from_slice(
         revm::primitives::Address(from.0.into())
@@ -41,4 +69,14 @@ pub fn create_contract_address(from: Address, nonce: u64) -> Address {
             .0
             .as_ref(),
     )
+}
+
+#[cfg(not(feature = "revm"))]
+pub fn create_contract_address(from: Address, nonce: u64) -> Address {
+    use ethrex_rlp::encode::encode;
+    use sha3::{Digest, Keccak256};
+
+    let encoded = encode((from, nonce));
+    let hash = Keccak256::digest(&encoded);
+    Address::from_slice(&hash[12..])
 }

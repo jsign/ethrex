@@ -1,10 +1,13 @@
 pub mod levm;
+#[cfg(feature = "revm")]
 pub mod revm;
 
+#[cfg(feature = "revm")]
 use self::revm::db::evm_state;
 use crate::db::{DynVmDatabase, VmDatabase};
 use crate::errors::EvmError;
 use crate::execution_result::ExecutionResult;
+#[cfg(feature = "revm")]
 use crate::helpers::{SpecId, fork_to_spec_id, spec_id};
 use ethrex_common::Address;
 use ethrex_common::types::requests::Requests;
@@ -17,7 +20,9 @@ use ethrex_levm::db::Database as LevmDatabase;
 use ethrex_levm::db::gen_db::GeneralizedDatabase;
 use ethrex_levm::vm::VMType;
 use levm::LEVM;
+#[cfg(feature = "revm")]
 use revm::REVM;
+#[cfg(feature = "revm")]
 use revm::db::EvmState;
 use std::fmt;
 use std::sync::Arc;
@@ -27,6 +32,7 @@ use tracing::instrument;
 pub enum EvmEngine {
     #[default]
     LEVM,
+    #[cfg(feature = "revm")]
     REVM,
 }
 
@@ -34,6 +40,7 @@ impl fmt::Display for EvmEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EvmEngine::LEVM => write!(f, "levm"),
+            #[cfg(feature = "revm")]
             EvmEngine::REVM => write!(f, "revm"),
         }
     }
@@ -45,6 +52,7 @@ impl TryFrom<String> for EvmEngine {
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.to_lowercase().as_str() {
+            #[cfg(feature = "revm")]
             "revm" => Ok(EvmEngine::REVM),
             "levm" => Ok(EvmEngine::LEVM),
             _ => Err(EvmError::InvalidEVM(s)),
@@ -55,9 +63,8 @@ impl TryFrom<String> for EvmEngine {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Evm {
-    REVM {
-        state: EvmState,
-    },
+    #[cfg(feature = "revm")]
+    REVM { state: EvmState },
     LEVM {
         db: GeneralizedDatabase,
         vm_type: VMType,
@@ -67,6 +74,7 @@ pub enum Evm {
 impl std::fmt::Debug for Evm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { .. } => write!(f, "REVM"),
             Evm::LEVM { .. } => {
                 write!(f, "LEVM")
@@ -81,6 +89,7 @@ impl Evm {
         let wrapped_db: DynVmDatabase = Box::new(db);
 
         match engine {
+            #[cfg(feature = "revm")]
             EvmEngine::REVM => Evm::REVM {
                 state: evm_state(wrapped_db),
             },
@@ -92,20 +101,24 @@ impl Evm {
     }
 
     pub fn new_for_l2(engine: EvmEngine, db: impl VmDatabase + 'static) -> Result<Self, EvmError> {
-        if let EvmEngine::REVM = engine {
-            return Err(EvmError::InvalidEVM(
-                "REVM is not supported for L2".to_string(),
-            ));
+        match engine {
+            #[cfg(feature = "revm")]
+            EvmEngine::REVM => {
+                return Err(EvmError::InvalidEVM(
+                    "REVM is not supported for L2".to_string(),
+                ));
+            }
+            EvmEngine::LEVM => {
+                let wrapped_db: DynVmDatabase = Box::new(db);
+
+                let evm = Evm::LEVM {
+                    db: GeneralizedDatabase::new(Arc::new(wrapped_db)),
+                    vm_type: VMType::L2,
+                };
+
+                Ok(evm)
+            }
         }
-
-        let wrapped_db: DynVmDatabase = Box::new(db);
-
-        let evm = Evm::LEVM {
-            db: GeneralizedDatabase::new(Arc::new(wrapped_db)),
-            vm_type: VMType::L2,
-        };
-
-        Ok(evm)
     }
 
     pub fn new_from_db_for_l1(store: Arc<impl LevmDatabase + 'static>) -> Self {
@@ -126,6 +139,7 @@ impl Evm {
     #[instrument(level = "trace", name = "Block execution", skip_all)]
     pub fn execute_block(&mut self, block: &Block) -> Result<BlockExecutionResult, EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => REVM::execute_block(block, state),
             Evm::LEVM { db, vm_type } => LEVM::execute_block(block, db, *vm_type),
         }
@@ -142,6 +156,7 @@ impl Evm {
         sender: Address,
     ) -> Result<(Receipt, u64), EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => {
                 let chain_config = state.chain_config()?;
                 let execution_result = REVM::execute_tx(
@@ -182,6 +197,7 @@ impl Evm {
 
     pub fn undo_last_tx(&mut self) -> Result<(), EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { .. } => Err(EvmError::InvalidEVM(
                 "Undoing transaction not supported in REVM".to_string(),
             )),
@@ -194,6 +210,7 @@ impl Evm {
     /// This function is used to run/apply all the system contracts to the state.
     pub fn apply_system_calls(&mut self, block_header: &BlockHeader) -> Result<(), EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => {
                 let chain_config = state.chain_config()?;
                 let spec_id = spec_id(&chain_config, block_header.timestamp);
@@ -234,6 +251,7 @@ impl Evm {
     /// They may have the same name, but they serve for different purposes.
     pub fn get_state_transitions(&mut self) -> Result<Vec<AccountUpdate>, EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => Ok(REVM::get_state_transitions(state)),
             Evm::LEVM { db, .. } => LEVM::get_state_transitions(db),
         }
@@ -243,6 +261,7 @@ impl Evm {
     /// Applies the withdrawals to the state or the block_chache if using [LEVM].
     pub fn process_withdrawals(&mut self, withdrawals: &[Withdrawal]) -> Result<(), EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => REVM::process_withdrawals(state, withdrawals),
             Evm::LEVM { db, .. } => LEVM::process_withdrawals(db, withdrawals),
         }
@@ -257,6 +276,7 @@ impl Evm {
             Evm::LEVM { db, vm_type } => {
                 levm::extract_all_requests_levm(receipts, db, header, *vm_type)
             }
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => revm::extract_all_requests(receipts, state, header),
         }
     }
@@ -265,9 +285,10 @@ impl Evm {
         &mut self,
         tx: &GenericTransaction,
         header: &BlockHeader,
-        fork: Fork,
+        #[cfg_attr(not(feature = "revm"), allow(unused_variables))] fork: Fork,
     ) -> Result<ExecutionResult, EvmError> {
         match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => {
                 let spec_id = fork_to_spec_id(fork);
                 self::revm::helpers::simulate_tx_from_generic(tx, header, state, spec_id)
@@ -280,9 +301,10 @@ impl Evm {
         &mut self,
         tx: &GenericTransaction,
         header: &BlockHeader,
-        fork: Fork,
+        #[cfg_attr(not(feature = "revm"), allow(unused_variables))] fork: Fork,
     ) -> Result<(u64, AccessList, Option<String>), EvmError> {
         let result = match self {
+            #[cfg(feature = "revm")]
             Evm::REVM { state } => {
                 let spec_id = fork_to_spec_id(fork);
                 self::revm::helpers::create_access_list(tx, header, state, spec_id)?

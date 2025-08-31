@@ -1,9 +1,11 @@
+#[cfg(feature = "revm")]
 use std::fmt::Display;
 
 use ethereum_types::{H160, H256};
 use ethrex_common::{Address, types::BlockHash};
 use ethrex_levm::errors::{DatabaseError as LevmDatabaseError, InternalError, VMError};
 use ethrex_trie::TrieError;
+#[cfg(feature = "revm")]
 use revm::primitives::{
     Address as RevmAddress, B256 as RevmB256, U256 as RevmU256, result::EVMError as RevmError,
 };
@@ -41,14 +43,19 @@ pub enum ProverDBError {
     Evm(#[from] Box<EvmError>), // boxed to avoid cyclic definition
     #[error("Trie error: {0}")]
     Trie(#[from] TrieError),
+    #[cfg(feature = "revm")]
     #[error("State proofs error: {0}")]
     StateProofs(#[from] StateProofsError),
+    #[cfg(feature = "revm")]
     #[error("Account {0} not found")]
     AccountNotFound(RevmAddress),
+    #[cfg(feature = "revm")]
     #[error("Code by hash {0} not found")]
     CodeNotFound(RevmB256),
+    #[cfg(feature = "revm")]
     #[error("Storage for address {0} not found")]
     StorageNotFound(RevmAddress),
+    #[cfg(feature = "revm")]
     #[error("Storage value for address {0} and key {1} not found")]
     StorageValueNotFound(RevmAddress, RevmU256),
     #[error("Hash of block with number {0} not found")]
@@ -83,6 +90,7 @@ pub enum ProverDBError {
     Unreachable(String),
 }
 
+#[cfg(feature = "revm")]
 #[derive(Debug, Error)]
 pub enum StateProofsError {
     #[error("Trie error: {0}")]
@@ -99,6 +107,7 @@ pub enum StateProofsError {
     StorageProofNotFound(RevmAddress, RevmU256),
 }
 
+#[cfg(feature = "revm")]
 impl<E: Display> From<RevmError<E>> for EvmError {
     fn from(value: RevmError<E>) -> Self {
         match value {
