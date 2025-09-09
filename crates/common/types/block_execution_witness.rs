@@ -486,7 +486,7 @@ impl GuestProgramState {
         for header in self.block_headers.values() {
             if header.hash.get().is_some() {
                 return Err(GuestProgramStateError::Custom(format!(
-                    "Block header hash is already set for {}",
+                    "Block header hash is already set 2 for {}",
                     header.number
                 )));
             }
