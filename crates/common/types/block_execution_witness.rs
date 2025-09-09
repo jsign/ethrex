@@ -497,7 +497,7 @@ impl GuestProgramState {
             // Verify each block's header hash is uninitialized
             if block.header.hash.get().is_some() {
                 return Err(GuestProgramStateError::Custom(format!(
-                    "Block header hash is already set for {}",
+                    "Block header hash is already 3 set for {}",
                     block.header.number
                 )));
             }
