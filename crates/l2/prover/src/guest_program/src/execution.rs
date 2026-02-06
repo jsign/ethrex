@@ -20,6 +20,8 @@ use ethrex_rlp::encode::RLPEncode;
 use ethrex_vm::{Evm, EvmError, GuestProgramStateWrapper, VmDatabase};
 use std::collections::{BTreeMap, HashMap};
 
+use ziskos::{ziskos_profile_end, ziskos_profile_start};
+
 #[cfg(not(feature = "l2"))]
 use ethrex_common::types::ELASTICITY_MULTIPLIER;
 #[cfg(feature = "l2")]
@@ -126,6 +128,7 @@ pub fn stateless_validation_l1(
     elasticity_multiplier: u64,
     chain_id: u64,
 ) -> Result<ProgramOutput, StatelessExecutionError> {
+    ziskos_profile_start!(PRE_STATE_INIT = 30);
     let guest_program_state: GuestProgramState =
         report_cycles("guest_program_state_initialization", || {
             execution_witness
@@ -134,11 +137,13 @@ pub fn stateless_validation_l1(
         })?;
 
     let mut wrapped_db = GuestProgramStateWrapper::new(guest_program_state);
+    ziskos_profile_end!(PRE_STATE_INIT);
 
     let chain_config = wrapped_db.get_chain_config().map_err(|_| {
         StatelessExecutionError::Internal("No chain config in execution witness".to_string())
     })?;
 
+    ziskos_profile_start!(ANCESTOR_VALIDATION = 31);
     // Hashing is an expensive operation in zkVMs, this way we avoid hashing twice
     // (once in get_first_invalid_block_hash(), later in validate_block()).
     report_cycles("initialize_block_header_hashes", || {
@@ -154,7 +159,9 @@ pub fn stateless_validation_l1(
         }
         Ok(())
     })?;
+    ziskos_profile_end!(ANCESTOR_VALIDATION);
 
+    ziskos_profile_start!(PRE_STATE_VERIFICATION = 32);
     // Validate the initial state
     let parent_block_header = wrapped_db
         .get_block_parent_header(
@@ -175,7 +182,9 @@ pub fn stateless_validation_l1(
     if initial_state_hash != parent_block_header.state_root {
         return Err(StatelessExecutionError::InvalidInitialStateTrie);
     }
+    ziskos_profile_end!(PRE_STATE_VERIFICATION);
 
+    ziskos_profile_start!(BLOCK_EXECUTION = 33);
     // Execute blocks
     let mut parent_block_header = &parent_block_header;
     let mut acc_account_updates: BTreeMap<Address, AccountUpdate> = BTreeMap::new();
@@ -243,7 +252,9 @@ pub fn stateless_validation_l1(
         non_privileged_count += block.body.transactions.len();
         parent_block_header = &block.header;
     }
+    ziskos_profile_end!(BLOCK_EXECUTION);
 
+    ziskos_profile_start!(POST_STATE_ROOT_CALCUATION = 34);
     let final_state_root = report_cycles("get_final_state_root", || {
         wrapped_db
             .state_trie_root()
@@ -258,6 +269,7 @@ pub fn stateless_validation_l1(
         validate_state_root(&last_block.header, final_state_root)
             .map_err(|_chain_err| StatelessExecutionError::InvalidFinalStateTrie)
     })?;
+    ziskos_profile_end!(POST_STATE_ROOT_CALCUATION);
 
     Ok(ProgramOutput {
         initial_state_hash,

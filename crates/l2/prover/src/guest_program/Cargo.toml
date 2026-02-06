@@ -22,6 +22,8 @@ ethrex-storage = { path = "../../../../storage", default-features = false }
 ethrex-trie = { path = "../../../../common/trie", default-features = false }
 ethrex-l2-common = { path = "../../../common", default-features = false }
 
+ziskos = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v0.15.0" }
+
 [build-dependencies]
 hex.workspace = true
 risc0-build = { version = "=3.0.3", optional = true }

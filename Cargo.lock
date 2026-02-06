@@ -4809,6 +4809,7 @@ dependencies = [
  "sp1-build",
  "sp1-sdk",
  "thiserror 2.0.17",
+ "ziskos",
 ]
 
 [[package]]
