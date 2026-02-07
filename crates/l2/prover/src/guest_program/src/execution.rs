@@ -184,13 +184,13 @@ pub fn stateless_validation_l1(
     }
     ziskos_profile_end!(PRE_STATE_VERIFICATION);
 
-    ziskos_profile_start!(BLOCK_EXECUTION = 33);
     // Execute blocks
     let mut parent_block_header = &parent_block_header;
     let mut acc_account_updates: BTreeMap<Address, AccountUpdate> = BTreeMap::new();
     let mut non_privileged_count = 0;
 
     for block in blocks.iter() {
+        ziskos_profile_start!(VALIDATE_BLOCK_CONSENSUS = 33);
         // Validate the block
         report_cycles("validate_block", || {
             validate_block(
@@ -201,22 +201,30 @@ pub fn stateless_validation_l1(
             )
             .map_err(StatelessExecutionError::BlockValidationError)
         })?;
+        ziskos_profile_end!(VALIDATE_BLOCK_CONSENSUS);
 
+        ziskos_profile_start!(SETUP_EVM = 34);
         let mut vm = report_cycles("setup_evm", || {
             let vm = Evm::new_for_l1(wrapped_db.clone());
             Ok::<_, StatelessExecutionError>(vm)
         })?;
+        ziskos_profile_end!(SETUP_EVM);
 
+        ziskos_profile_start!(EXECUTE_BLOCK = 35);
         let result = report_cycles("execute_block", || {
             vm.execute_block(block)
                 .map_err(StatelessExecutionError::EvmError)
         })?;
+        ziskos_profile_end!(EXECUTE_BLOCK);
 
+        ziskos_profile_start!(GET_STATE_TRANSITIONS = 36);
         let account_updates = report_cycles("get_state_transitions", || {
             vm.get_state_transitions()
                 .map_err(StatelessExecutionError::EvmError)
         })?;
+        ziskos_profile_end!(GET_STATE_TRANSITIONS);
 
+        ziskos_profile_start!(APPLY_ACCOUNT_UPDATES = 37);
         // Update db for the next block
         report_cycles("apply_account_updates", || {
             wrapped_db
@@ -232,7 +240,9 @@ pub fn stateless_validation_l1(
                 acc_account_updates.insert(address, account);
             }
         }
+        ziskos_profile_end!(APPLY_ACCOUNT_UPDATES);
 
+        ziskos_profile_start!(POST_VALIDATION_CHECKS = 38);
         report_cycles("validate_gas_and_receipts", || {
             validate_gas_used(&result.receipts, &block.header)
                 .map_err(StatelessExecutionError::GasValidationError)
@@ -248,13 +258,13 @@ pub fn stateless_validation_l1(
             validate_requests_hash(&block.header, &chain_config, &result.requests)
                 .map_err(StatelessExecutionError::RequestsRootValidationError)
         })?;
+        ziskos_profile_end!(POST_VALIDATION_CHECKS);
 
         non_privileged_count += block.body.transactions.len();
         parent_block_header = &block.header;
     }
-    ziskos_profile_end!(BLOCK_EXECUTION);
 
-    ziskos_profile_start!(POST_STATE_ROOT_CALCUATION = 34);
+    ziskos_profile_start!(POST_STATE_ROOT_CALCUATION = 39);
     let final_state_root = report_cycles("get_final_state_root", || {
         wrapped_db
             .state_trie_root()
