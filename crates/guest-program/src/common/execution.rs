@@ -11,6 +11,7 @@ use ethrex_vm::{Evm, GuestProgramStateWrapper, VmDatabase};
 
 use crate::common::ExecutionError;
 use crate::report_cycles;
+use ziskos::{ziskos_profile_end, ziskos_profile_start};
 
 /// Result of executing a batch of blocks.
 pub struct BatchExecutionResult {
@@ -51,6 +52,7 @@ where
 {
     let chain_id = execution_witness.chain_config.chain_id;
 
+    ziskos_profile_start!(PRE_STATE_INIT = 30);
     let ethrex_guest_program_state: GuestProgramState =
         report_cycles("ethrex_guest_program_state_initialization", || {
             GuestProgramState::from_witness(execution_witness, crypto.as_ref())
@@ -58,11 +60,13 @@ where
         })?;
 
     let mut wrapped_db = GuestProgramStateWrapper::new(ethrex_guest_program_state, crypto.clone());
+    ziskos_profile_end!(PRE_STATE_INIT);
 
     let chain_config = wrapped_db.get_chain_config().map_err(|_| {
         ExecutionError::Internal("No chain config in execution witness".to_string())
     })?;
 
+    ziskos_profile_start!(ANCESTOR_VALIDATION = 31);
     // Hashing is expensive in zkVMs - initialize block header hashes once
     report_cycles("initialize_block_header_hashes", || {
         wrapped_db.initialize_block_header_hashes(blocks)
@@ -75,7 +79,9 @@ where
         }
         Ok(())
     })?;
+    ziskos_profile_end!(ANCESTOR_VALIDATION);
 
+    ziskos_profile_start!(PRE_STATE_VERIFICATION = 32);
     // Validate initial state
     let parent_block_header = wrapped_db
         .get_block_parent_header(
@@ -96,6 +102,7 @@ where
     if initial_state_hash != parent_block_header.state_root {
         return Err(ExecutionError::InvalidInitialStateTrie);
     }
+    ziskos_profile_end!(PRE_STATE_VERIFICATION);
 
     // Execute blocks
     let mut parent_block_header = &parent_block_header;
@@ -103,6 +110,7 @@ where
     let mut non_privileged_count: usize = 0;
 
     for (i, block) in blocks.iter().enumerate() {
+        ziskos_profile_start!(VALIDATE_BLOCK_CONSENSUS = 33);
         // Validate that the block header and body match (transactions root, withdrawals root)
         report_cycles("validate_block_body", || {
             validate_block_body(&block.header, &block.body, crypto.as_ref())
@@ -119,22 +127,30 @@ where
             )
             .map_err(ExecutionError::BlockValidation)
         })?;
+        ziskos_profile_end!(VALIDATE_BLOCK_CONSENSUS);
 
+        ziskos_profile_start!(SETUP_EVM = 34);
         // Create VM using the provided factory
         let mut vm = report_cycles("setup_evm", || vm_factory(&wrapped_db, i))?;
+        ziskos_profile_end!(SETUP_EVM);
 
+        ziskos_profile_start!(EXECUTE_BLOCK = 35);
         // Execute block
         let (result, _bal) = report_cycles("execute_block", || {
             vm.execute_block(block).map_err(ExecutionError::Evm)
         })?;
+        ziskos_profile_end!(EXECUTE_BLOCK);
 
         let receipts = result.receipts;
         let block_gas_used = result.block_gas_used;
 
+        ziskos_profile_start!(GET_STATE_TRANSITIONS = 36);
         let account_updates = report_cycles("get_state_transitions", || {
             vm.get_state_transitions().map_err(ExecutionError::Evm)
         })?;
+        ziskos_profile_end!(GET_STATE_TRANSITIONS);
 
+        ziskos_profile_start!(APPLY_ACCOUNT_UPDATES = 37);
         // Apply state transitions to the db (needed for both next block execution
         // and final state validation via state_trie_root())
         report_cycles("apply_account_updates", || {
@@ -150,7 +166,9 @@ where
             .iter()
             .filter(|tx| !tx.is_privileged())
             .count();
+        ziskos_profile_end!(APPLY_ACCOUNT_UPDATES);
 
+        ziskos_profile_start!(POST_VALIDATION_CHECKS = 38);
         // Validate gas and receipts
         report_cycles("validate_gas_and_receipts", || {
             validate_gas_used(block_gas_used, &block.header).map_err(ExecutionError::GasValidation)
@@ -165,11 +183,13 @@ where
             validate_requests_hash(&block.header, &chain_config, &result.requests)
                 .map_err(ExecutionError::RequestsRootValidation)
         })?;
+        ziskos_profile_end!(POST_VALIDATION_CHECKS);
 
         acc_receipts.push(receipts);
         parent_block_header = &block.header;
     }
 
+    ziskos_profile_start!(POST_STATE_ROOT_CALCUATION = 39);
     // Validate final state
     let last_block = blocks.last().ok_or(ExecutionError::EmptyBatch)?;
 
@@ -182,8 +202,8 @@ where
     if final_state_hash != last_block.header.state_root {
         return Err(ExecutionError::InvalidFinalStateTrie);
     }
-
     let last_block_hash = last_block.header.compute_block_hash(crypto.as_ref());
+    ziskos_profile_end!(POST_STATE_ROOT_CALCUATION);
 
     Ok(BatchExecutionResult {
         receipts: acc_receipts,
