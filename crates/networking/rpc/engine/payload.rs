@@ -3,7 +3,11 @@ use ethrex_blockchain::payload::PayloadBuildResult;
 use ethrex_common::types::block_access_list::BlockAccessList;
 use ethrex_common::types::payload::PayloadBundle;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
-use ethrex_common::types::{Block, BlockBody, BlockHash, BlockNumber, Fork};
+use ethrex_common::types::{
+    Block, BlockBody, BlockHash, BlockNumber, ExecutionPayloadValidationError, Fork,
+    validate_blob_versioned_hashes, validate_block_hash, validate_execution_payload_v1,
+    validate_execution_payload_v2, validate_execution_payload_v3, validate_execution_payload_v4,
+};
 use ethrex_common::{H256, U256};
 use ethrex_p2p::sync::SyncMode;
 use ethrex_rlp::error::RLPDecodeError;
@@ -37,7 +41,7 @@ impl RpcHandler for NewPayloadV1Request {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        validate_execution_payload_v1(&self.payload)?;
+        validate_execution_payload_v1(&self.payload).map_err(map_payload_validation_error)?;
         let block = match get_block_from_payload(&self.payload, None, None, None) {
             Ok(block) => block,
             Err(err) => {
@@ -65,10 +69,10 @@ impl RpcHandler for NewPayloadV2Request {
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
         let chain_config = &context.storage.get_chain_config();
         if chain_config.is_shanghai_activated(self.payload.timestamp) {
-            validate_execution_payload_v2(&self.payload)?;
+            validate_execution_payload_v2(&self.payload).map_err(map_payload_validation_error)?;
         } else {
             // Behave as a v1
-            validate_execution_payload_v1(&self.payload)?;
+            validate_execution_payload_v1(&self.payload).map_err(map_payload_validation_error)?;
         }
         let block = match get_block_from_payload(&self.payload, None, None, None) {
             Ok(block) => block,
@@ -136,7 +140,7 @@ impl RpcHandler for NewPayloadV3Request {
             }
         };
         validate_fork(&block, Fork::Cancun, &context)?;
-        validate_execution_payload_v3(&self.payload)?;
+        validate_execution_payload_v3(&self.payload).map_err(map_payload_validation_error)?;
         let payload_status = handle_new_payload_v3(
             &self.payload,
             context,
@@ -219,7 +223,7 @@ impl RpcHandler for NewPayloadV4Request {
             )));
         }
         // We use v3 since the execution payload remains the same.
-        validate_execution_payload_v3(&self.payload)?;
+        validate_execution_payload_v3(&self.payload).map_err(map_payload_validation_error)?;
         let payload_status = handle_new_payload_v3(
             &self.payload,
             context,
@@ -295,7 +299,7 @@ impl RpcHandler for NewPayloadV5Request {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        validate_execution_payload_v4(&self.payload)?;
+        validate_execution_payload_v4(&self.payload).map_err(map_payload_validation_error)?;
 
         // validate the received requests
         validate_execution_requests(&self.execution_requests)?;
@@ -787,65 +791,6 @@ fn parse_execution_payload(params: &Option<Vec<Value>>) -> Result<ExecutionPaylo
     serde_json::from_value(params[0].clone()).map_err(|_| RpcErr::WrongParam("payload".to_string()))
 }
 
-fn validate_execution_payload_v1(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // Validate that only the required arguments are present
-    if payload.withdrawals.is_some() {
-        return Err(RpcErr::WrongParam("withdrawals".to_string()));
-    }
-    if payload.blob_gas_used.is_some() {
-        return Err(RpcErr::WrongParam("blob_gas_used".to_string()));
-    }
-    if payload.excess_blob_gas.is_some() {
-        return Err(RpcErr::WrongParam("excess_blob_gas".to_string()));
-    }
-
-    Ok(())
-}
-
-fn validate_execution_payload_v2(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // Validate that only the required arguments are present
-    if payload.withdrawals.is_none() {
-        return Err(RpcErr::WrongParam("withdrawals".to_string()));
-    }
-    if payload.blob_gas_used.is_some() {
-        return Err(RpcErr::WrongParam("blob_gas_used".to_string()));
-    }
-    if payload.excess_blob_gas.is_some() {
-        return Err(RpcErr::WrongParam("excess_blob_gas".to_string()));
-    }
-
-    Ok(())
-}
-
-fn validate_execution_payload_v3(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // Validate that only the required arguments are present
-    if payload.withdrawals.is_none() {
-        return Err(RpcErr::WrongParam("withdrawals".to_string()));
-    }
-    if payload.blob_gas_used.is_none() {
-        return Err(RpcErr::WrongParam("blob_gas_used".to_string()));
-    }
-    if payload.excess_blob_gas.is_none() {
-        return Err(RpcErr::WrongParam("excess_blob_gas".to_string()));
-    }
-
-    Ok(())
-}
-
-#[inline]
-fn validate_execution_payload_v4(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // This method follows the same specification as `engine_newPayloadV4` additionally
-    // rejects payload without block access list
-
-    if payload.block_access_list.is_none() {
-        return Err(RpcErr::WrongParam("block_access_list".to_string()));
-    }
-
-    validate_execution_payload_v3(payload)?;
-
-    Ok(())
-}
-
 fn validate_payload_v1_v2(block: &Block, context: &RpcApiContext) -> Result<(), RpcErr> {
     let chain_config = &context.storage.get_chain_config();
     if chain_config.is_cancun_activated(block.header.timestamp) {
@@ -905,8 +850,10 @@ async fn handle_new_payload_v1_v2(
         ));
     };
     // Validate block hash
-    if let Err(RpcErr::Internal(error_msg)) = validate_block_hash(payload, &block) {
-        return Ok(PayloadStatus::invalid_with_err(&error_msg));
+    if let Err(error) = validate_block_hash(payload, &block) {
+        return Ok(PayloadStatus::invalid_with_err(
+            &render_block_hash_validation_error(error),
+        ));
     }
 
     // Check for invalid ancestors
@@ -934,17 +881,9 @@ async fn handle_new_payload_v3(
     expected_blob_versioned_hashes: Vec<H256>,
     bal: Option<BlockAccessList>,
 ) -> Result<PayloadStatus, RpcErr> {
-    // V3 specific: validate blob hashes
-    let blob_versioned_hashes: Vec<H256> = block
-        .body
-        .transactions
-        .iter()
-        .flat_map(|tx| tx.blob_versioned_hashes())
-        .collect();
-
-    if expected_blob_versioned_hashes != blob_versioned_hashes {
+    if let Err(error) = validate_blob_versioned_hashes(&block, &expected_blob_versioned_hashes) {
         return Ok(PayloadStatus::invalid_with_err(
-            "Invalid blob_versioned_hashes",
+            &render_blob_hashes_validation_error(error),
         ));
     }
 
@@ -997,18 +936,36 @@ fn get_block_from_payload(
         parent_beacon_block_root,
         requests_hash,
         block_access_list_hash,
+        &ethrex_crypto::NativeCrypto,
     )
 }
 
-fn validate_block_hash(payload: &ExecutionPayload, block: &Block) -> Result<(), RpcErr> {
-    let block_hash = payload.block_hash;
-    let actual_block_hash = block.hash();
-    if block_hash != actual_block_hash {
-        return Err(RpcErr::Internal(format!(
-            "Invalid block hash. Expected {actual_block_hash:#x}, got {block_hash:#x}"
-        )));
+fn map_payload_validation_error(error: ExecutionPayloadValidationError) -> RpcErr {
+    match error {
+        ExecutionPayloadValidationError::MissingField { field }
+        | ExecutionPayloadValidationError::UnexpectedField { field } => {
+            RpcErr::WrongParam(field.to_string())
+        }
+        other => RpcErr::Internal(other.to_string()),
     }
-    Ok(())
+}
+
+fn render_block_hash_validation_error(error: ExecutionPayloadValidationError) -> String {
+    match error {
+        ExecutionPayloadValidationError::BlockHashMismatch { expected, actual } => {
+            format!("Invalid block hash. Expected {expected:#x}, got {actual:#x}")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn render_blob_hashes_validation_error(error: ExecutionPayloadValidationError) -> String {
+    match error {
+        ExecutionPayloadValidationError::BlobVersionedHashesMismatch { .. } => {
+            "Invalid blob_versioned_hashes".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 pub async fn add_block(
