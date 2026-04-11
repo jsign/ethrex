@@ -10,9 +10,10 @@ use crate::{EvmError, ExecutionResult};
 use bytes::Bytes;
 use ethrex_common::constants::EMPTY_KECCACK_HASH;
 use ethrex_common::types::block_access_list::{
-    BalAddressIndex, BlockAccessList, find_exact_change_balance, find_exact_change_code,
-    find_exact_change_nonce, find_exact_change_storage, has_exact_change_balance,
-    has_exact_change_code, has_exact_change_nonce, has_exact_change_storage,
+    BalAddressIndex, BlockAccessList, RawAccessObservation, find_exact_change_balance,
+    find_exact_change_code, find_exact_change_nonce, find_exact_change_storage,
+    has_exact_change_balance, has_exact_change_code, has_exact_change_nonce,
+    has_exact_change_storage,
 };
 use ethrex_common::types::fee_config::FeeConfig;
 use ethrex_common::types::{AuthorizationTuple, Code, EIP7702Transaction};
@@ -49,6 +50,7 @@ use ethrex_levm::{
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::min;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -342,7 +344,12 @@ impl LEVM {
             // post-withdrawal/request state.
             #[allow(clippy::cast_possible_truncation)]
             let withdrawal_idx = (block.body.transactions.len() as u16) + 1;
-            Self::validate_bal_withdrawal_index(db, bal, withdrawal_idx)?;
+            Self::validate_current_state_against_bal_index(
+                db,
+                bal,
+                withdrawal_idx,
+                "withdrawal/request phase",
+            )?;
 
             // Mark storage_reads that occurred during the withdrawal/request phase.
             if !unread_storage_reads.is_empty() {
@@ -564,100 +571,117 @@ impl LEVM {
         }
     }
 
-    ///
-    /// For each account in the BAL, extracts the **final** post-block state
-    /// (highest `block_access_index` entry per field) and builds an AccountUpdate.
-    /// State comes entirely from the BAL — no execution needed.
-    fn bal_to_account_updates(
+    /// For each account in the BAL, extracts the latest state visible through
+    /// `max_idx` and builds an `AccountUpdate`. State comes entirely from the BAL.
+    pub(crate) fn account_updates_from_bal_through_index(
         bal: &BlockAccessList,
         store: &dyn Database,
+        max_idx: u16,
     ) -> Result<Vec<AccountUpdate>, EvmError> {
         use ethrex_common::types::AccountInfo;
 
         let mut updates = Vec::new();
 
-        // Batch prefetch all accounts with writes so per-account lookups are cache hits
+        // Batch prefetch all accounts with writes visible through the cutoff so
+        // per-account lookups are cache hits.
         let write_addrs: Vec<Address> = bal
             .accounts()
             .iter()
             .filter(|ac| {
-                !ac.balance_changes.is_empty()
-                    || !ac.nonce_changes.is_empty()
-                    || !ac.code_changes.is_empty()
-                    || !ac.storage_changes.is_empty()
+                ac.balance_changes
+                    .iter()
+                    .any(|c| c.block_access_index <= max_idx)
+                    || ac
+                        .nonce_changes
+                        .iter()
+                        .any(|c| c.block_access_index <= max_idx)
+                    || ac
+                        .code_changes
+                        .iter()
+                        .any(|c| c.block_access_index <= max_idx)
+                    || ac.storage_changes.iter().any(|sc| {
+                        sc.slot_changes
+                            .first()
+                            .is_some_and(|c| c.block_access_index <= max_idx)
+                    })
             })
             .map(|ac| ac.address)
             .collect();
-        store
-            .prefetch_accounts(&write_addrs)
-            .map_err(|e| EvmError::Custom(format!("bal_to_account_updates prefetch: {e}")))?;
+        store.prefetch_accounts(&write_addrs).map_err(|e| {
+            EvmError::Custom(format!(
+                "account_updates_from_bal_through_index prefetch: {e}"
+            ))
+        })?;
 
         for acct_changes in bal.accounts() {
             let addr = acct_changes.address;
 
-            // Skip accounts with only reads and no writes
-            let has_writes = !acct_changes.balance_changes.is_empty()
-                || !acct_changes.nonce_changes.is_empty()
-                || !acct_changes.code_changes.is_empty()
-                || !acct_changes.storage_changes.is_empty();
-            if !has_writes {
+            let balance_pos = acct_changes
+                .balance_changes
+                .partition_point(|c| c.block_access_index <= max_idx);
+            let nonce_pos = acct_changes
+                .nonce_changes
+                .partition_point(|c| c.block_access_index <= max_idx);
+            let code_pos = acct_changes
+                .code_changes
+                .partition_point(|c| c.block_access_index <= max_idx);
+            let any_storage = acct_changes.storage_changes.iter().any(|sc| {
+                sc.slot_changes
+                    .first()
+                    .is_some_and(|c| c.block_access_index <= max_idx)
+            });
+
+            if balance_pos == 0 && nonce_pos == 0 && code_pos == 0 && !any_storage {
                 continue;
             }
 
-            // Load pre-state for unchanged fields (cache hit after prefetch)
-            let prestate = store
-                .get_account_state(addr)
-                .map_err(|e| EvmError::Custom(format!("bal_to_account_updates: {e}")))?;
+            let prestate = store.get_account_state(addr).map_err(|e| {
+                EvmError::Custom(format!("account_updates_from_bal_through_index: {e}"))
+            })?;
 
-            // Final balance: last entry (highest index) or prestate
-            let balance = acct_changes
-                .balance_changes
-                .last()
-                .map(|c| c.post_balance)
-                .unwrap_or(prestate.balance);
+            let balance = if balance_pos > 0 {
+                acct_changes.balance_changes[balance_pos - 1].post_balance
+            } else {
+                prestate.balance
+            };
 
-            // Final nonce: last entry or prestate
-            let nonce = acct_changes
-                .nonce_changes
-                .last()
-                .map(|c| c.post_nonce)
-                .unwrap_or(prestate.nonce);
+            let nonce = if nonce_pos > 0 {
+                acct_changes.nonce_changes[nonce_pos - 1].post_nonce
+            } else {
+                prestate.nonce
+            };
 
-            // Final code: last entry or prestate
-            let (code_hash, code) = if let Some(c) = acct_changes.code_changes.last() {
-                Self::code_from_bal(&c.new_code)
+            let (code_hash, code) = if code_pos > 0 {
+                Self::code_from_bal(&acct_changes.code_changes[code_pos - 1].new_code)
             } else {
                 (prestate.code_hash, None)
             };
 
-            // Storage: per slot, last entry (highest index)
             let mut added_storage = FxHashMap::with_capacity_and_hasher(
                 acct_changes.storage_changes.len(),
                 Default::default(),
             );
             for slot_change in &acct_changes.storage_changes {
-                if let Some(last) = slot_change.slot_changes.last() {
+                let pos = slot_change
+                    .slot_changes
+                    .partition_point(|c| c.block_access_index <= max_idx);
+                if pos > 0 {
                     let key = ethrex_common::utils::u256_to_h256(slot_change.slot);
-                    added_storage.insert(key, last.post_value);
+                    added_storage.insert(key, slot_change.slot_changes[pos - 1].post_value);
                 }
             }
 
-            // Detect account removal (EIP-161): post-state empty but pre-state existed
             let post_empty = balance.is_zero() && nonce == 0 && code_hash == *EMPTY_KECCACK_HASH;
             let pre_empty = prestate.balance.is_zero()
                 && prestate.nonce == 0
                 && prestate.code_hash == *EMPTY_KECCACK_HASH;
             let removed = post_empty && !pre_empty;
 
-            let balance_changed = acct_changes
-                .balance_changes
-                .last()
-                .is_some_and(|c| c.post_balance != prestate.balance);
-            let nonce_changed = acct_changes
-                .nonce_changes
-                .last()
-                .is_some_and(|c| c.post_nonce != prestate.nonce);
-            let code_changed = acct_changes.code_changes.last().is_some();
+            let balance_changed = balance_pos > 0
+                && acct_changes.balance_changes[balance_pos - 1].post_balance != prestate.balance;
+            let nonce_changed = nonce_pos > 0
+                && acct_changes.nonce_changes[nonce_pos - 1].post_nonce != prestate.nonce;
+            let code_changed = code_pos > 0;
             let acc_info_updated = balance_changed || nonce_changed || code_changed;
 
             if !removed && !acc_info_updated && added_storage.is_empty() {
@@ -692,6 +716,18 @@ impl LEVM {
         }
 
         Ok(updates)
+    }
+
+    /// For each account in the BAL, extracts the final post-block state and
+    /// builds an `AccountUpdate`. State comes entirely from the BAL.
+    fn bal_to_account_updates(
+        bal: &BlockAccessList,
+        store: &dyn Database,
+        tx_count: usize,
+    ) -> Result<Vec<AccountUpdate>, EvmError> {
+        #[allow(clippy::cast_possible_truncation)]
+        let post_tx_index = (tx_count + 1) as u16;
+        Self::account_updates_from_bal_through_index(bal, store, post_tx_index)
     }
 
     /// Pre-seed a GeneralizedDatabase with BAL-derived state for a specific tx.
@@ -826,6 +862,16 @@ impl LEVM {
         Ok(())
     }
 
+    /// Public wrapper around BAL seeding for chunked execution paths outside the VM crate.
+    pub fn seed_db_from_bal_state(
+        db: &mut GeneralizedDatabase,
+        bal: &BlockAccessList,
+        max_idx: u16,
+        validation_index: &BalAddressIndex,
+    ) -> Result<(), EvmError> {
+        Self::seed_db_from_bal(db, bal, max_idx, &validation_index.accounts_by_min_index)
+    }
+
     /// Execute block transactions in parallel using BAL-derived state.
     /// Only called for Amsterdam+ blocks when the header BAL is available.
     ///
@@ -859,7 +905,7 @@ impl LEVM {
 
         // 1. Convert BAL → AccountUpdates and send to merkleizer (single batch)
         //    This covers ALL state changes: system calls, txs, withdrawals.
-        let account_updates = Self::bal_to_account_updates(bal, store.as_ref())?;
+        let account_updates = Self::bal_to_account_updates(bal, store.as_ref(), n_txs)?;
         merkleizer
             .send(account_updates)
             .map_err(|e| EvmError::Custom(format!("merkleizer send failed: {e}")))?;
@@ -1479,66 +1525,89 @@ impl LEVM {
         Ok(())
     }
 
-    /// Validates BAL entries at the withdrawal index against actual post-withdrawal state.
-    ///
-    /// After `process_withdrawals` + `extract_all_requests_levm` run on the BAL-seeded
-    /// DB, `current_accounts_state` reflects the actual state. Any BAL claim at the
-    /// withdrawal index that doesn't match is either a mismatch or extraneous.
-    fn validate_bal_withdrawal_index(
+    /// Public wrapper around per-tx BAL validation for chunked execution paths outside the VM crate.
+    pub fn validate_current_tx_against_bal(
         db: &GeneralizedDatabase,
         bal: &BlockAccessList,
-        withdrawal_idx: u16,
+        index: &BalAddressIndex,
+        system_seed: &CacheDB,
+        bal_idx: u16,
+        seed_idx: u16,
     ) -> Result<(), EvmError> {
+        Self::validate_tx_execution(
+            bal_idx,
+            seed_idx,
+            &db.current_accounts_state,
+            &db.codes,
+            bal,
+            index,
+            system_seed,
+            &db.store,
+        )
+        .map_err(|e| EvmError::Custom(e.to_string()))
+    }
+
+    /// Validates exact BAL mutation claims for the current DB state at a single
+    /// block access index, and rejects unexpected actual mutations at that index.
+    pub fn validate_current_state_against_bal_index(
+        db: &GeneralizedDatabase,
+        bal: &BlockAccessList,
+        bal_idx: u16,
+        phase_name: &str,
+    ) -> Result<(), EvmError> {
+        let addr_to_idx: FxHashMap<_, _> = bal
+            .accounts()
+            .iter()
+            .enumerate()
+            .map(|(idx, acct)| (acct.address, idx))
+            .collect();
+
         for acct in bal.accounts() {
             let addr = acct.address;
             let actual = db.current_accounts_state.get(&addr);
 
             // Balance
-            if let Some(expected) = find_exact_change_balance(&acct.balance_changes, withdrawal_idx)
-            {
+            if let Some(expected) = find_exact_change_balance(&acct.balance_changes, bal_idx) {
                 match actual {
                     Some(a) if a.info.balance == expected => {}
                     Some(a) => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} balance \
-                             mismatch at index {withdrawal_idx}: BAL={expected}, actual={}",
+                            "BAL validation failed for {phase_name}: account {addr:?} balance \
+                             mismatch at index {bal_idx}: BAL={expected}, actual={}",
                             a.info.balance
                         )));
                     }
                     None => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} has \
-                             balance change at index {withdrawal_idx} but was not touched \
-                             by withdrawal/request phase"
+                            "BAL validation failed for {phase_name}: account {addr:?} has \
+                             balance change at index {bal_idx} but was not touched"
                         )));
                     }
                 }
             }
 
             // Nonce
-            if let Some(expected) = find_exact_change_nonce(&acct.nonce_changes, withdrawal_idx) {
+            if let Some(expected) = find_exact_change_nonce(&acct.nonce_changes, bal_idx) {
                 match actual {
                     Some(a) if a.info.nonce == expected => {}
                     Some(a) => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} nonce \
-                             mismatch at index {withdrawal_idx}: BAL={expected}, actual={}",
+                            "BAL validation failed for {phase_name}: account {addr:?} nonce \
+                             mismatch at index {bal_idx}: BAL={expected}, actual={}",
                             a.info.nonce
                         )));
                     }
                     None => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} has \
-                             nonce change at index {withdrawal_idx} but was not touched \
-                             by withdrawal/request phase"
+                            "BAL validation failed for {phase_name}: account {addr:?} has \
+                             nonce change at index {bal_idx} but was not touched"
                         )));
                     }
                 }
             }
 
             // Code
-            if let Some(expected_code) = find_exact_change_code(&acct.code_changes, withdrawal_idx)
-            {
+            if let Some(expected_code) = find_exact_change_code(&acct.code_changes, bal_idx) {
                 let code_hash = if expected_code.is_empty() {
                     *EMPTY_KECCACK_HASH
                 } else {
@@ -1548,15 +1617,14 @@ impl LEVM {
                     Some(a) if a.info.code_hash == code_hash => {}
                     Some(_) => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} code \
-                             mismatch at index {withdrawal_idx}"
+                            "BAL validation failed for {phase_name}: account {addr:?} code \
+                             mismatch at index {bal_idx}"
                         )));
                     }
                     None => {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} has \
-                             code change at index {withdrawal_idx} but was not touched \
-                             by withdrawal/request phase"
+                            "BAL validation failed for {phase_name}: account {addr:?} has \
+                             code change at index {bal_idx} but was not touched"
                         )));
                     }
                 }
@@ -1564,15 +1632,13 @@ impl LEVM {
 
             // Storage writes
             for sc in &acct.storage_changes {
-                if let Some(expected_value) =
-                    find_exact_change_storage(&sc.slot_changes, withdrawal_idx)
-                {
+                if let Some(expected_value) = find_exact_change_storage(&sc.slot_changes, bal_idx) {
                     let key = ethrex_common::utils::u256_to_h256(sc.slot);
                     let actual_value = actual.and_then(|a| a.storage.get(&key)).copied();
                     if actual_value != Some(expected_value) {
                         return Err(EvmError::Custom(format!(
-                            "BAL validation failed for withdrawal: account {addr:?} storage \
-                             slot {} mismatch at index {withdrawal_idx}: BAL={expected_value}, \
+                            "BAL validation failed for {phase_name}: account {addr:?} storage \
+                             slot {} mismatch at index {bal_idx}: BAL={expected_value}, \
                              actual={actual_value:?}",
                             sc.slot
                         )));
@@ -1580,6 +1646,197 @@ impl LEVM {
                 }
             }
         }
+
+        for (addr, account) in &db.current_accounts_state {
+            if account.is_unmodified() {
+                continue;
+            }
+
+            let initial = db
+                .initial_accounts_state
+                .get(addr)
+                .or_else(|| db.shared_base.as_ref().and_then(|base| base.get(addr)));
+
+            let Some(&bal_acct_idx) = addr_to_idx.get(addr) else {
+                let initial_info = initial.map(|acct| acct.info.clone()).unwrap_or_default();
+                if account.info != initial_info {
+                    return Err(EvmError::Custom(format!(
+                        "BAL validation failed for {phase_name}: account {addr:?} was modified \
+                         by execution but is absent from BAL"
+                    )));
+                }
+
+                for (key, &value) in &account.storage {
+                    let initial_value = initial
+                        .and_then(|acct| acct.storage.get(key))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            db.store.get_storage_value(*addr, *key).unwrap_or_default()
+                        });
+                    if value != initial_value {
+                        return Err(EvmError::Custom(format!(
+                            "BAL validation failed for {phase_name}: account {addr:?} storage \
+                             slot {} changed by execution but is absent from BAL",
+                            U256::from_big_endian(key.as_bytes())
+                        )));
+                    }
+                }
+
+                continue;
+            };
+
+            let acct = &bal.accounts()[bal_acct_idx];
+            let initial_info = initial.map(|acct| acct.info.clone()).unwrap_or_default();
+
+            if !has_exact_change_balance(&acct.balance_changes, bal_idx)
+                && account.info.balance != initial_info.balance
+            {
+                return Err(EvmError::Custom(format!(
+                    "BAL validation failed for {phase_name}: account {addr:?} balance changed \
+                     by execution ({}) but BAL has no balance change at index {bal_idx}",
+                    account.info.balance
+                )));
+            }
+
+            if !has_exact_change_nonce(&acct.nonce_changes, bal_idx)
+                && account.info.nonce != initial_info.nonce
+            {
+                return Err(EvmError::Custom(format!(
+                    "BAL validation failed for {phase_name}: account {addr:?} nonce changed by \
+                     execution ({}) but BAL has no nonce change at index {bal_idx}",
+                    account.info.nonce
+                )));
+            }
+
+            if !has_exact_change_code(&acct.code_changes, bal_idx)
+                && account.info.code_hash != initial_info.code_hash
+            {
+                return Err(EvmError::Custom(format!(
+                    "BAL validation failed for {phase_name}: account {addr:?} code changed by \
+                     execution but BAL has no code change at index {bal_idx}"
+                )));
+            }
+
+            for (key_h256, &value) in &account.storage {
+                let slot_u256 = U256::from_big_endian(key_h256.as_bytes());
+                let pos = acct
+                    .storage_changes
+                    .partition_point(|sc| sc.slot < slot_u256);
+                let has_exact_change = pos < acct.storage_changes.len()
+                    && acct.storage_changes[pos].slot == slot_u256
+                    && has_exact_change_storage(&acct.storage_changes[pos].slot_changes, bal_idx);
+                if has_exact_change {
+                    continue;
+                }
+
+                let initial_value = initial
+                    .and_then(|acct| acct.storage.get(key_h256))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        db.store
+                            .get_storage_value(*addr, *key_h256)
+                            .unwrap_or_default()
+                    });
+
+                if value != initial_value {
+                    return Err(EvmError::Custom(format!(
+                        "BAL validation failed for {phase_name}: account {addr:?} storage slot \
+                         {slot_u256} changed by execution ({value}) but BAL has no change at \
+                         index {bal_idx}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Consumes the active BAL recorder and returns the raw set of addresses and
+    /// storage slots actually accessed during execution.
+    pub fn take_raw_access_observation(
+        db: &mut GeneralizedDatabase,
+    ) -> Option<RawAccessObservation> {
+        db.bal_recorder
+            .take()
+            .map(|recorder| recorder.into_raw_access_observation())
+    }
+
+    /// Validates the full BAL read-only access surface against the union of raw
+    /// accesses actually observed across all execution phases and chunks.
+    pub fn validate_raw_access_observation(
+        bal: &BlockAccessList,
+        observation: &RawAccessObservation,
+    ) -> Result<(), EvmError> {
+        let mut bal_written_slots = BTreeSet::new();
+        let mut bal_storage_reads = BTreeSet::new();
+        let mut bal_non_pure_accounts = BTreeSet::new();
+        let mut bal_pure_accounts = BTreeSet::new();
+
+        for acct in bal.accounts() {
+            let has_mutation = !acct.storage_changes.is_empty()
+                || !acct.balance_changes.is_empty()
+                || !acct.nonce_changes.is_empty()
+                || !acct.code_changes.is_empty();
+            if !acct.is_empty() {
+                bal_non_pure_accounts.insert(acct.address);
+            }
+            if !has_mutation && acct.storage_reads.is_empty() {
+                bal_pure_accounts.insert(acct.address);
+            }
+
+            bal_written_slots.extend(acct.storage_changes.iter().map(|change| {
+                (
+                    acct.address,
+                    ethrex_common::utils::u256_to_h256(change.slot),
+                )
+            }));
+            bal_storage_reads.extend(
+                acct.storage_reads
+                    .iter()
+                    .map(|slot| (acct.address, ethrex_common::utils::u256_to_h256(*slot))),
+            );
+        }
+
+        let actual_read_only_slots: BTreeSet<_> = observation
+            .storage_accesses
+            .difference(&bal_written_slots)
+            .copied()
+            .collect();
+        let actual_pure_accounts: BTreeSet<_> = observation
+            .touched_addresses
+            .difference(&bal_non_pure_accounts)
+            .copied()
+            .collect();
+
+        if let Some((addr, key)) = bal_storage_reads.difference(&actual_read_only_slots).next() {
+            let slot = ethrex_common::BigEndianHash::into_uint(key);
+            return Err(EvmError::Custom(format!(
+                "BAL validation failed: storage_read for account {addr:?} slot {slot} was never \
+                 actually observed during block execution"
+            )));
+        }
+
+        if let Some((addr, key)) = actual_read_only_slots.difference(&bal_storage_reads).next() {
+            let slot = ethrex_common::BigEndianHash::into_uint(key);
+            return Err(EvmError::Custom(format!(
+                "BAL validation failed: observed read-only storage access for account {addr:?} \
+                 slot {slot} is absent from BAL"
+            )));
+        }
+
+        if let Some(addr) = bal_pure_accounts.difference(&actual_pure_accounts).next() {
+            return Err(EvmError::Custom(format!(
+                "BAL validation failed: account {addr:?} has no mutations and no storage reads \
+                 but was never actually accessed during block execution"
+            )));
+        }
+
+        if let Some(addr) = actual_pure_accounts.difference(&bal_pure_accounts).next() {
+            return Err(EvmError::Custom(format!(
+                "BAL validation failed: observed pure-access account {addr:?} is absent from BAL"
+            )));
+        }
+
         Ok(())
     }
 
@@ -2394,14 +2651,20 @@ mod bal_tests {
     use ethrex_common::H256;
     use ethrex_common::types::AccountState;
     use ethrex_common::types::block_access_list::{
-        AccountChanges, BalanceChange, NonceChange, SlotChange, StorageChange,
+        AccountChanges, BalanceChange, NonceChange, RawAccessObservation, SlotChange, StorageChange,
     };
+    use ethrex_levm::account::{AccountStatus, LevmAccount};
     use ethrex_levm::errors::DatabaseError;
+    use std::sync::Arc;
 
     fn addr(byte: u8) -> Address {
         let mut a = Address::zero();
         a.0[19] = byte;
         a
+    }
+
+    fn observed_storage(address: Address, slot: u64) -> (Address, H256) {
+        (address, H256::from_low_u64_be(slot))
     }
 
     /// Minimal in-memory store for testing bal_to_account_updates.
@@ -2476,7 +2739,7 @@ mod bal_tests {
                 )]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 2).unwrap();
         assert_eq!(updates.len(), 1);
         let u = &updates[0];
         assert_eq!(u.address, address);
@@ -2513,7 +2776,7 @@ mod bal_tests {
             ]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 3).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].info.as_ref().unwrap().balance, U256::from(700));
     }
@@ -2528,7 +2791,7 @@ mod bal_tests {
             AccountChanges::new(address).with_storage_reads(vec![U256::from(1)]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 1).unwrap();
         assert!(updates.is_empty());
     }
 
@@ -2552,7 +2815,7 @@ mod bal_tests {
                 .with_nonce_changes(vec![NonceChange::new(1, 0)]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 1).unwrap();
         assert_eq!(updates.len(), 1);
         assert!(updates[0].removed);
     }
@@ -2570,7 +2833,7 @@ mod bal_tests {
             )]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 1).unwrap();
         assert_eq!(updates.len(), 1);
         let key = ethrex_common::utils::u256_to_h256(U256::from(7));
         assert_eq!(*updates[0].added_storage.get(&key).unwrap(), U256::zero());
@@ -2594,10 +2857,139 @@ mod bal_tests {
                 .with_nonce_changes(vec![NonceChange::new(1, 1)]),
         ]);
 
-        let updates = LEVM::bal_to_account_updates(&bal, &store).unwrap();
+        let updates = LEVM::bal_to_account_updates(&bal, &store, 1).unwrap();
         assert_eq!(updates.len(), 1);
         let u = &updates[0];
         assert_eq!(u.info.as_ref().unwrap().code_hash, expected_hash);
         assert_eq!(u.code.as_ref().unwrap().bytecode, code);
+    }
+
+    #[test]
+    fn account_updates_from_bal_through_index_distinguishes_tx_and_post_phase() {
+        let address = addr(14);
+        let store = MockStore::new().with_account(
+            address,
+            AccountState {
+                balance: U256::from(100),
+                nonce: 0,
+                code_hash: *EMPTY_KECCACK_HASH,
+                storage_root: H256::zero(),
+            },
+        );
+
+        let bal = BlockAccessList::from_accounts(vec![
+            AccountChanges::new(address).with_balance_changes(vec![
+                BalanceChange::new(1, U256::from(90)),
+                BalanceChange::new(2, U256::from(95)),
+            ]),
+        ]);
+
+        let tx_updates = LEVM::account_updates_from_bal_through_index(&bal, &store, 1).unwrap();
+        assert_eq!(tx_updates.len(), 1);
+        assert_eq!(tx_updates[0].info.as_ref().unwrap().balance, U256::from(90));
+
+        let final_updates = LEVM::account_updates_from_bal_through_index(&bal, &store, 2).unwrap();
+        assert_eq!(final_updates.len(), 1);
+        assert_eq!(
+            final_updates[0].info.as_ref().unwrap().balance,
+            U256::from(95)
+        );
+    }
+
+    #[test]
+    fn raw_access_validation_rejects_missing_bal_storage_read() {
+        let bal = BlockAccessList::from_accounts(vec![
+            AccountChanges::new(addr(7)).with_storage_reads(vec![U256::from(7_u64)]),
+        ]);
+
+        let err = LEVM::validate_raw_access_observation(&bal, &RawAccessObservation::default())
+            .expect_err("missing BAL storage read should be rejected");
+        assert!(matches!(err, EvmError::Custom(message) if message.contains("storage_read")));
+    }
+
+    #[test]
+    fn raw_access_validation_rejects_observed_read_only_slot_absent_from_bal() {
+        let mut observation = RawAccessObservation::default();
+        observation
+            .storage_accesses
+            .insert(observed_storage(addr(8), 7));
+
+        let err = LEVM::validate_raw_access_observation(&BlockAccessList::new(), &observation)
+            .expect_err("observed read-only slot absent from BAL should be rejected");
+        assert!(matches!(err, EvmError::Custom(message) if message.contains("absent from BAL")));
+    }
+
+    #[test]
+    fn raw_access_validation_accepts_read_then_later_write() {
+        let bal = BlockAccessList::from_accounts(vec![
+            AccountChanges::new(addr(9)).with_storage_changes(vec![SlotChange::with_changes(
+                U256::from(7_u64),
+                vec![StorageChange::new(2, U256::from(1_u64))],
+            )]),
+        ]);
+        let mut observation = RawAccessObservation::default();
+        observation
+            .storage_accesses
+            .insert(observed_storage(addr(9), 7));
+
+        LEVM::validate_raw_access_observation(&bal, &observation)
+            .expect("a slot read in one chunk and written later must remain valid");
+    }
+
+    #[test]
+    fn raw_access_validation_rejects_pure_access_mismatches() {
+        let bal = BlockAccessList::from_accounts(vec![AccountChanges::new(addr(10))]);
+
+        let err = LEVM::validate_raw_access_observation(&bal, &RawAccessObservation::default())
+            .expect_err("BAL pure-access account must be observed");
+        assert!(
+            matches!(err, EvmError::Custom(message) if message.contains("never actually accessed"))
+        );
+
+        let mut observation = RawAccessObservation::default();
+        observation.touched_addresses.insert(addr(11));
+
+        let err = LEVM::validate_raw_access_observation(&BlockAccessList::new(), &observation)
+            .expect_err("observed pure-access account absent from BAL should be rejected");
+        assert!(
+            matches!(err, EvmError::Custom(message) if message.contains("pure-access account"))
+        );
+    }
+
+    #[test]
+    fn exact_index_validation_rejects_missing_actual_change() {
+        let db = GeneralizedDatabase::new(Arc::new(MockStore::new()));
+        let bal = BlockAccessList::from_accounts(vec![
+            AccountChanges::new(addr(12))
+                .with_balance_changes(vec![BalanceChange::new(1, U256::from(1_u64))]),
+        ]);
+
+        let err = LEVM::validate_current_state_against_bal_index(&db, &bal, 1, "test phase")
+            .expect_err("missing actual change should be rejected");
+        assert!(
+            matches!(err, EvmError::Custom(message) if message.contains("test phase") && message.contains("index 1"))
+        );
+    }
+
+    #[test]
+    fn exact_index_validation_rejects_unexpected_actual_mutation() {
+        let address = addr(13);
+        let mut db = GeneralizedDatabase::new(Arc::new(MockStore::new()));
+        let initial = LevmAccount::from(AccountState::default());
+        let mut current = initial.clone();
+        current.info.balance = U256::from(5_u64);
+        current.status = AccountStatus::Modified;
+        current.exists = true;
+        db.initial_accounts_state.insert(address, initial);
+        db.current_accounts_state.insert(address, current);
+
+        let err = LEVM::validate_current_state_against_bal_index(
+            &db,
+            &BlockAccessList::new(),
+            1,
+            "test phase",
+        )
+        .expect_err("unexpected mutation should be rejected");
+        assert!(matches!(err, EvmError::Custom(message) if message.contains("absent from BAL")));
     }
 }

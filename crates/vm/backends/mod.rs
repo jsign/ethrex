@@ -4,7 +4,7 @@ use levm::LEVM;
 use crate::db::{DynVmDatabase, VmDatabase};
 use crate::errors::EvmError;
 use crate::execution_result::ExecutionResult;
-use ethrex_common::types::block_access_list::BlockAccessList;
+use ethrex_common::types::block_access_list::{BlockAccessList, RawAccessObservation};
 use ethrex_common::types::requests::Requests;
 use ethrex_common::types::{
     AccessList, AccountUpdate, Block, BlockHeader, Fork, GenericTransaction, Receipt, Transaction,
@@ -12,8 +12,9 @@ use ethrex_common::types::{
 };
 use ethrex_common::{Address, types::fee_config::FeeConfig};
 use ethrex_crypto::Crypto;
+use ethrex_levm::account::AccountStatus;
 pub use ethrex_levm::call_frame::CallFrameBackup;
-use ethrex_levm::db::gen_db::GeneralizedDatabase;
+pub use ethrex_levm::db::gen_db::{CacheDB, GeneralizedDatabase};
 pub use ethrex_levm::db::{CachingDatabase, Database as LevmDatabase};
 use ethrex_levm::errors::ExecutionReport;
 use ethrex_levm::vm::VMType;
@@ -195,6 +196,73 @@ impl Evm {
         LEVM::get_state_transitions(&mut self.db)
     }
 
+    /// Wraps [LEVM::get_state_transitions_tx], preserving the post-phase state as the new initial state.
+    pub fn get_state_transitions_tx(&mut self) -> Result<Vec<AccountUpdate>, EvmError> {
+        LEVM::get_state_transitions_tx(&mut self.db)
+    }
+
+    /// Builds `AccountUpdate`s from BAL entries visible through `max_idx`,
+    /// using the EVM backing store as the pre-state source.
+    pub fn account_updates_from_bal_through_index(
+        &self,
+        bal: &BlockAccessList,
+        max_idx: u16,
+    ) -> Result<Vec<AccountUpdate>, EvmError> {
+        LEVM::account_updates_from_bal_through_index(bal, self.db.store.as_ref(), max_idx)
+    }
+
+    /// Seeds the VM database with BAL-derived state visible through `max_idx`, then
+    /// normalizes the seeded accounts so later state-transition extraction is relative
+    /// to the chunk start instead of the original pre-block state.
+    pub fn seed_chunk_start_from_bal(
+        &mut self,
+        bal: &BlockAccessList,
+        max_idx: u16,
+        validation_index: &ethrex_common::types::block_access_list::BalAddressIndex,
+    ) -> Result<(), EvmError> {
+        LEVM::seed_db_from_bal_state(&mut self.db, bal, max_idx, validation_index)?;
+
+        for account in self.db.current_accounts_state.values_mut() {
+            account.status = AccountStatus::Unmodified;
+        }
+
+        for (address, account) in self.db.current_accounts_state.clone() {
+            self.db.initial_accounts_state.insert(address, account);
+        }
+
+        Ok(())
+    }
+
+    /// Validates the current per-tx VM state against the BAL entries for `bal_idx`.
+    pub fn validate_current_tx_against_bal(
+        &self,
+        bal: &BlockAccessList,
+        validation_index: &ethrex_common::types::block_access_list::BalAddressIndex,
+        system_seed: &CacheDB,
+        bal_idx: u16,
+        seed_idx: u16,
+    ) -> Result<(), EvmError> {
+        LEVM::validate_current_tx_against_bal(
+            &self.db,
+            bal,
+            validation_index,
+            system_seed,
+            bal_idx,
+            seed_idx,
+        )
+    }
+
+    /// Validates the current DB state against BAL mutation claims at a single
+    /// block access index.
+    pub fn validate_current_state_against_bal_index(
+        &self,
+        bal: &BlockAccessList,
+        bal_idx: u16,
+        phase_name: &str,
+    ) -> Result<(), EvmError> {
+        LEVM::validate_current_state_against_bal_index(&self.db, bal, bal_idx, phase_name)
+    }
+
     /// Wraps [LEVM::process_withdrawals].
     /// Applies the withdrawals to the state or the block_chache if using [LEVM].
     pub fn process_withdrawals(&mut self, withdrawals: &[Withdrawal]) -> Result<(), EvmError> {
@@ -221,6 +289,11 @@ impl Evm {
         self.db.take_bal()
     }
 
+    /// Takes the raw execution-access observation from the BAL recorder.
+    pub fn take_raw_access_observation(&mut self) -> Option<RawAccessObservation> {
+        LEVM::take_raw_access_observation(&mut self.db)
+    }
+
     /// Enables BAL (Block Access List) recording for EIP-7928.
     pub fn enable_bal_recording(&mut self) {
         self.db.enable_bal_recording();
@@ -229,6 +302,15 @@ impl Evm {
     /// Sets the current block access index for BAL recording per EIP-7928 spec (uint16).
     pub fn set_bal_index(&mut self, index: u16) {
         self.db.set_bal_index(index);
+    }
+
+    /// Validates that the raw observed access surface matches the full BAL
+    /// read-only access semantics.
+    pub fn validate_raw_access_observation(
+        bal: &BlockAccessList,
+        observation: &RawAccessObservation,
+    ) -> Result<(), EvmError> {
+        LEVM::validate_raw_access_observation(bal, observation)
     }
 
     pub fn simulate_tx_from_generic(

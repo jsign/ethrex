@@ -399,6 +399,19 @@ pub struct BlockAccessList {
     inner: Vec<AccountChanges>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RawAccessObservation {
+    pub touched_addresses: BTreeSet<Address>,
+    pub storage_accesses: BTreeSet<(Address, H256)>,
+}
+
+impl RawAccessObservation {
+    pub fn extend(&mut self, other: Self) {
+        self.touched_addresses.extend(other.touched_addresses);
+        self.storage_accesses.extend(other.storage_accesses);
+    }
+}
+
 impl BlockAccessList {
     /// Creates a new empty block access list.
     pub fn new() -> Self {
@@ -908,6 +921,34 @@ impl BlockAccessListRecorder {
     /// Returns the current block access index per EIP-7928 spec (uint16).
     pub fn current_index(&self) -> u16 {
         self.current_index
+    }
+
+    /// Projects the recorder into the raw set of accounts and storage slots
+    /// actually accessed during execution, without applying BAL-specific
+    /// filtering like read-to-write promotion or final read-only derivation.
+    pub fn into_raw_access_observation(self) -> RawAccessObservation {
+        let mut storage_accesses = BTreeSet::new();
+
+        for (address, reads) in self.storage_reads {
+            storage_accesses.extend(
+                reads
+                    .into_iter()
+                    .map(|slot| (address, crate::utils::u256_to_h256(slot))),
+            );
+        }
+
+        for (address, writes) in self.storage_writes {
+            storage_accesses.extend(
+                writes
+                    .into_keys()
+                    .map(|slot| (address, crate::utils::u256_to_h256(slot))),
+            );
+        }
+
+        RawAccessObservation {
+            touched_addresses: self.touched_addresses.into_iter().collect(),
+            storage_accesses,
+        }
     }
 
     /// Marks the recorder as being inside a system contract call.

@@ -1,8 +1,15 @@
 pub mod backend;
+#[cfg(feature = "eip-8025")]
+pub mod chunked_l1;
 pub mod protocol;
 pub mod prover;
 
 pub use crate::backend::{BackendError, BackendType, ExecBackend, ProverBackend};
+#[cfg(feature = "eip-8025")]
+pub use crate::chunked_l1::{
+    ChunkedL1Config, ChunkedL1Execution, execute_chunked_l1, non_privileged_transaction_count,
+    partition_chunk_ranges,
+};
 pub use crate::protocol::ProofData;
 pub use crate::prover::{Prover, ProverPullConfig};
 

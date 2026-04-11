@@ -54,27 +54,26 @@ pub fn execution_program(
     })
 }
 
-/// Execute the L1 stateless validation program (EIP-8025).
+/// Reconstruct the payload `Block` and request commitment for EIP-8025
+/// execution paths.
 ///
-/// This transforms the SSZ `NewPayloadRequest` into a `Block`, validates it,
-/// executes it statelessly, and produces the `hash_tree_root` commitment.
-///
-/// Takes the raw `NewPayloadRequest` and `ExecutionWitness` decoded from the
-/// EIP-8025 wire format (see [`decode_eip8025`](super::decode_eip8025)).
+/// This helper injects an optional header BAL hash and validates the payload
+/// block hash plus versioned hashes before execution begins.
 #[cfg(feature = "eip-8025")]
-pub fn execution_program(
-    new_payload_request: ethrex_common::types::eip8025_ssz::NewPayloadRequest,
-    execution_witness: ethrex_common::types::block_execution_witness::ExecutionWitness,
-    crypto: Arc<dyn Crypto>,
-) -> Result<ProgramOutput, ExecutionError> {
+pub fn prepare_new_payload_request(
+    new_payload_request: &ethrex_common::types::eip8025_ssz::NewPayloadRequest,
+    block_access_list_hash: Option<ethrex_common::H256>,
+    crypto: &dyn Crypto,
+) -> Result<(ethrex_common::types::Block, [u8; 32]), ExecutionError> {
     use libssz_merkle::{HashTreeRoot, Sha2Hasher};
 
     // Compute the hash_tree_root before consuming the payload.
     let request_root = new_payload_request.hash_tree_root(&Sha2Hasher);
 
     // Transform SSZ NewPayloadRequest → Block
-    let block = new_payload_request_to_block(&new_payload_request, crypto.as_ref())
+    let mut block = new_payload_request_to_block(new_payload_request, crypto)
         .map_err(|e| ExecutionError::Internal(format!("payload conversion: {e}")))?;
+    block.header.block_access_list_hash = block_access_list_hash;
 
     // Validate block_hash: the SSZ payload carries block_hash which must match
     // the hash of the reconstructed block header.
@@ -88,7 +87,23 @@ pub fn execution_program(
     }
 
     // Validate blob versioned hashes
-    validate_versioned_hashes(&block, &new_payload_request)?;
+    validate_versioned_hashes(&block, new_payload_request)?;
+
+    Ok((block, request_root))
+}
+
+/// Execute the L1 stateless validation program (EIP-8025).
+///
+/// Takes the raw `NewPayloadRequest` and `ExecutionWitness` decoded from the
+/// EIP-8025 wire format (see [`decode_eip8025`](super::decode_eip8025)).
+#[cfg(feature = "eip-8025")]
+pub fn execution_program(
+    new_payload_request: ethrex_common::types::eip8025_ssz::NewPayloadRequest,
+    execution_witness: ethrex_common::types::block_execution_witness::ExecutionWitness,
+    crypto: Arc<dyn Crypto>,
+) -> Result<ProgramOutput, ExecutionError> {
+    let (block, request_root) =
+        prepare_new_payload_request(&new_payload_request, None, crypto.as_ref())?;
 
     // Execute statelessly — reuse the common `execute_blocks` infrastructure
     let _result = execute_blocks(
