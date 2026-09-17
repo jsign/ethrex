@@ -260,6 +260,7 @@ pub async fn init_l2(
         blob_sampling_enabled: false, // L2 rejects blob txs; no eth/72 sampling
         blob_eager_provider: false,
         precompute_witnesses: opts.node_opts.precompute_witnesses,
+        builder_witness_mode: Default::default(),
         private_mempool: opts.node_opts.mempool_private,
         precompile_cache_enabled: true,
         min_tip_wei: opts.node_opts.mempool_min_tip,
@@ -513,6 +514,7 @@ pub async fn init_native_rollup_l2(
         blob_sampling_enabled: false, // L2 rejects blob txs; no eth/72 sampling
         blob_eager_provider: false,
         precompute_witnesses: opts.node_opts.precompute_witnesses,
+        builder_witness_mode: Default::default(),
         precompile_cache_enabled: true,
         max_queued_txs_per_account: opts.node_opts.mempool_max_queued_txs_per_account,
         bal_parallel_exec_enabled: true,

@@ -47,6 +47,7 @@ pub mod error;
 pub mod fork_choice;
 pub mod mempool;
 pub mod payload;
+pub mod payload_witness;
 pub mod prewarm;
 pub mod sampling;
 pub mod stateless;
@@ -105,13 +106,14 @@ use ethrex_vm::backends::CachingDatabase;
 use ethrex_vm::backends::VMType;
 #[cfg(feature = "rayon")]
 use ethrex_vm::backends::levm::LEVM;
-use ethrex_vm::backends::levm::db::DatabaseLogger;
+use ethrex_vm::backends::levm::db::{DatabaseLogger, ExecutionAccesses};
 use ethrex_vm::{BlockExecutionResult, DynVmDatabase, Evm, EvmError, VmDatabase};
 use mempool::{
     BalanceCheck, FRAME_CANONICAL_PAYMASTER_CODE_HASH, FramePaymasterReservation, Mempool,
     SenderAdmission, is_canonical_paymaster,
 };
-use payload::PayloadOrTask;
+use payload::PayloadCache;
+use payload_witness::PayloadWitnessMode;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -269,7 +271,7 @@ pub struct Blockchain {
     ///
     /// Maps payload IDs to either completed payloads or in-progress build tasks.
     /// Kept around in case consensus requests the same payload twice.
-    pub payloads: Arc<TokioMutex<Vec<(u64, PayloadOrTask)>>>,
+    pub payloads: PayloadCache,
     /// Persistent thread pool for merkleization workers.
     /// 17 threads: 16 shard workers + 1 watcher/coordination.
     ///
@@ -348,6 +350,8 @@ pub struct BlockchainOptions {
     pub max_blobs_per_block: Option<u32>,
     /// If true, computes execution witnesses upon receiving newPayload messages and stores them in local storage
     pub precompute_witnesses: bool,
+    /// Witness assembly policy for locally built L1 payloads.
+    pub builder_witness_mode: PayloadWitnessMode,
     /// If true, transactions submitted via this node's RPC (e.g.
     /// `eth_sendRawTransaction`) are kept private: they enter the mempool and
     /// can be included in blocks built locally, but are not propagated to
@@ -435,6 +439,7 @@ impl Default for BlockchainOptions {
             r#type: BlockchainType::default(),
             max_blobs_per_block: None,
             precompute_witnesses: false,
+            builder_witness_mode: PayloadWitnessMode::Off,
             private_mempool: false,
             precompile_cache_enabled: true,
             min_tip_wei: DEFAULT_MIN_TIP_WEI,
@@ -2265,7 +2270,7 @@ impl Blockchain {
         account_updates: Vec<AccountUpdate>,
         block: &Block,
         parent_header: BlockHeader,
-        logger: &DatabaseLogger,
+        accesses: &ExecutionAccesses,
     ) -> Result<ExecutionWitness, ChainError> {
         // Get state at previous block
         let trie = self
@@ -2300,11 +2305,7 @@ impl Blockchain {
         }
 
         // Get the used block hashes from the logger
-        let blockhash_opcode_references = logger
-            .block_hashes_accessed
-            .lock()
-            .map_err(|_e| ChainError::WitnessGeneration("Failed to get block hashes".to_string()))?
-            .clone();
+        let blockhash_opcode_references = &accesses.block_hashes;
 
         // Access all the accounts needed for withdrawals
         if let Some(withdrawals) = block.body.withdrawals.as_ref() {
@@ -2319,22 +2320,15 @@ impl Blockchain {
 
         // Access all the accounts from the initial trie
         // Record all the storage nodes for the initial state
-        for (account, acc_keys) in logger
-            .state_accessed
-            .lock()
-            .map_err(|_e| {
-                ChainError::WitnessGeneration("Failed to execute with witness".to_string())
-            })?
-            .iter()
-        {
+        for (account, acc_keys) in &accesses.state {
             // Access the account from the state trie to record the nodes used to access it
             trie.get(&hash_address(account)).map_err(|_e| {
                 ChainError::WitnessGeneration("Failed to access account from trie".to_string())
             })?;
             // Get storage trie at before updates
             if !acc_keys.is_empty()
-                && let Ok(Some(storage_trie)) =
-                    self.storage.storage_trie(parent_header.hash(), *account)
+                && let Some(storage_trie) =
+                    self.storage.storage_trie(parent_header.hash(), *account)?
             {
                 let (storage_trie_witness, storage_trie) = TrieLogger::open_trie(storage_trie);
                 // Access all the keys
@@ -2349,22 +2343,8 @@ impl Blockchain {
             }
         }
 
-        // Store all the accessed evm bytecodes. `code_accessed` records one entry
-        // per read, and a contract read for both its bytecode and its length is
-        // recorded twice, so dedup before embedding: a repeated hash would put the
-        // same (up to 24KB) bytecode in the witness more than once.
-        let accessed_codes: Vec<H256> = {
-            let accessed = logger.code_accessed.lock().map_err(|_e| {
-                ChainError::WitnessGeneration("Failed to gather used bytecodes".to_string())
-            })?;
-            let mut seen = FxHashSet::with_capacity_and_hasher(accessed.len(), Default::default());
-            accessed
-                .iter()
-                .copied()
-                .filter(|h| seen.insert(*h))
-                .collect()
-        };
-        for code_hash in &accessed_codes {
+        // Accesses are frozen and deduplicated before witness assembly.
+        for code_hash in &accesses.codes {
             let code = self
                 .storage
                 .get_account_code(*code_hash)
@@ -2378,12 +2358,13 @@ impl Blockchain {
         }
 
         // Apply account updates to the trie recording all the necessary nodes to do so
-        let (storage_tries_after_update, _account_updates_list) =
+        let (storage_tries_after_update, account_updates_list) =
             self.storage.apply_account_updates_from_trie_with_witness(
                 trie,
                 &account_updates,
                 used_storage_tries,
             )?;
+        validate_state_root(&block.header, account_updates_list.state_trie_hash)?;
 
         for (address, (witness, _storage_trie)) in storage_tries_after_update {
             let mut witness = witness.lock().map_err(|_| {
@@ -2494,7 +2475,7 @@ impl Blockchain {
         Ok(ExecutionWitness {
             codes,
             block_headers_bytes,
-            first_block_number: parent_header.number,
+            first_block_number: block.header.number,
             chain_config: self.storage.get_chain_config(),
             state_trie_root,
             storage_trie_roots,
@@ -2734,7 +2715,9 @@ impl Blockchain {
                 account_updates,
                 &block,
                 parent_header,
-                &logger,
+                &logger
+                    .take_accesses()
+                    .map_err(|err| ChainError::WitnessGeneration(err.to_string()))?,
             )?;
             match (should_store_witness, force_witness) {
                 (true, true) => {

@@ -2,16 +2,14 @@ use bytes::Bytes;
 use ethrex_blockchain::error::ChainError;
 use ethrex_blockchain::payload::PayloadBuildResult;
 use ethrex_common::types::block_access_list::BlockAccessList;
-use ethrex_common::types::block_execution_witness::{
-    ExecutionWitness, ExtWitness, RpcExecutionWitness,
-};
+use ethrex_common::types::block_execution_witness::{ExecutionWitness, RpcExecutionWitness};
 use ethrex_common::types::payload::PayloadBundle;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
-use ethrex_common::types::{Block, BlockBody, BlockHash, BlockHeader, BlockNumber, Fork};
+use ethrex_common::types::{Block, BlockBody, BlockHash, BlockNumber, Fork};
 use ethrex_common::{H256, U256};
 use ethrex_crypto::NativeCrypto;
 use ethrex_p2p::sync::SyncMode;
-use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode, error::RLPDecodeError};
+use ethrex_rlp::{decode::RLPDecode, error::RLPDecodeError};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -19,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::rpc::{RpcApiContext, RpcHandler};
 use crate::types::payload::{
     ExecutionPayload, ExecutionPayloadBody, ExecutionPayloadBodyV2, ExecutionPayloadResponse,
-    PayloadStatus,
+    ExecutionPayloadWithWitnessResponse, PayloadStatus,
 };
 use crate::utils::RpcErr;
 use crate::utils::{RpcRequest, parse_json_hex};
@@ -703,35 +701,75 @@ impl RpcHandler for GetPayloadV6Request {
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
         let payload_bundle = get_payload(self.payload_id, &context).await?;
-        let chain_config = &context.storage.get_chain_config();
-
-        if !chain_config.is_amsterdam_activated(payload_bundle.block.header.timestamp) {
-            return Err(RpcErr::UnsupportedFork(format!(
-                "{:?}",
-                chain_config.get_fork(payload_bundle.block.header.timestamp)
-            )));
-        }
-
-        // V6 supports BAL (Amsterdam EL fork / Glamsterdam, EIP-7928)
-        let response = ExecutionPayloadResponse {
-            execution_payload: ExecutionPayload::from_block(
-                payload_bundle.block,
-                payload_bundle.block_access_list,
-            ),
-            block_value: payload_bundle.block_value,
-            blobs_bundle: Some(payload_bundle.blobs_bundle),
-            should_override_builder: Some(false),
-            execution_requests: Some(
-                payload_bundle
-                    .requests
-                    .into_iter()
-                    .filter(|r| !r.is_empty())
-                    .collect(),
-            ),
-        };
-
-        serde_json::to_value(response).map_err(|error| RpcErr::Internal(error.to_string()))
+        serde_json::to_value(payload_response_v6(payload_bundle, &context)?)
+            .map_err(|error| RpcErr::Internal(error.to_string()))
     }
+}
+
+/// Ethrex extension: retrieve the built payload and its original execution witness.
+pub struct GetPayloadWithWitnessV6Request {
+    pub payload_id: u64,
+}
+
+impl From<GetPayloadWithWitnessV6Request> for RpcRequest {
+    fn from(value: GetPayloadWithWitnessV6Request) -> Self {
+        RpcRequest {
+            method: "engine_getPayloadWithWitnessV6".into(),
+            params: Some(vec![serde_json::json!(U256::from(value.payload_id))]),
+            ..Default::default()
+        }
+    }
+}
+
+impl RpcHandler for GetPayloadWithWitnessV6Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        Ok(Self {
+            payload_id: parse_get_payload_request(params)?,
+        })
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        let result = context
+            .blockchain
+            .get_payload(self.payload_id)
+            .await
+            .map_err(|err| payload_retrieval_error(err, self.payload_id))?;
+        let witness = result.witness.clone();
+        // Apply exactly the normal V6 fork checks before starting on-demand work.
+        let payload = payload_response_v6(payload_bundle(result), &context)?;
+        let witness = witness
+            .get(context.blockchain.clone())
+            .await
+            .map_err(|err| RpcErr::Internal(err.to_string()))?;
+        serde_json::to_value(ExecutionPayloadWithWitnessResponse { payload, witness })
+            .map_err(|error| RpcErr::Internal(error.to_string()))
+    }
+}
+
+fn payload_response_v6(
+    bundle: PayloadBundle,
+    context: &RpcApiContext,
+) -> Result<ExecutionPayloadResponse, RpcErr> {
+    let config = context.storage.get_chain_config();
+    if !config.is_amsterdam_activated(bundle.block.header.timestamp) {
+        return Err(RpcErr::UnsupportedFork(format!(
+            "{:?}",
+            config.get_fork(bundle.block.header.timestamp)
+        )));
+    }
+    Ok(ExecutionPayloadResponse {
+        execution_payload: ExecutionPayload::from_block(bundle.block, bundle.block_access_list),
+        block_value: bundle.block_value,
+        blobs_bundle: Some(bundle.blobs_bundle),
+        should_override_builder: Some(false),
+        execution_requests: Some(
+            bundle
+                .requests
+                .into_iter()
+                .filter(|r| !r.is_empty())
+                .collect(),
+        ),
+    })
 }
 
 pub struct GetPayloadBodiesByHashV1Request {
@@ -1480,32 +1518,15 @@ fn encode_witness_for_engine_rpc(witness: ExecutionWitness) -> Result<Bytes, Rpc
 /// Encodes the witness in geth's opaque `engine_newPayloadWithWitness*` shape.
 ///
 /// Format: geth returns `rlp.EncodeToBytes(proofs)` from `newPayload`, and
-/// `stateless.Witness::EncodeRLP` delegates to [`ExtWitness`] — see its docs
+/// `stateless.Witness::EncodeRLP` delegates to [`ethrex_common::types::block_execution_witness::ExtWitness`] — see its docs
 /// for the shape and geth references.
 /// Additional references:
 /// https://github.com/ethereum/go-ethereum/blob/4daaaadfc4706b0a49d4dfde3559de7be968c28a/core/stateless/encoding.go#L92-L98
 /// https://github.com/ethereum/go-ethereum/blob/4daaaadfc4706b0a49d4dfde3559de7be968c28a/eth/catalyst/api.go#L915-L920
 fn encode_rpc_witness_for_engine_rpc(rpc_witness: RpcExecutionWitness) -> Result<Bytes, RpcErr> {
-    let mut headers = rpc_witness
-        .headers
-        .iter()
-        .map(|header| BlockHeader::decode(header.as_ref()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| RpcErr::Internal(format!("Failed to decode witness header: {error}")))?;
-    headers.sort_by_key(|header| header.number);
-    let mut codes = rpc_witness.codes;
-    codes.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    let mut state = rpc_witness.state;
-    state.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    let mut keys = rpc_witness.keys;
-    keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    let ext_witness = ExtWitness {
-        headers,
-        codes,
-        state,
-        keys,
-    };
-    Ok(Bytes::from(ext_witness.encode_to_vec()))
+    rpc_witness
+        .encode_engine()
+        .map_err(|error| RpcErr::Internal(format!("Failed to encode execution witness: {error}")))
 }
 
 fn parse_get_payload_request(params: &Option<Vec<Value>>) -> Result<u64, RpcErr> {
@@ -1547,48 +1568,38 @@ async fn get_payload(payload_id: u64, context: &RpcApiContext) -> Result<Payload
         id = %format!("{:#018x}", payload_id),
         "Requested payload with"
     );
-    let (blobs_bundle, requests, block_value, block, block_access_list) = {
-        let PayloadBuildResult {
-            blobs_bundle,
-            block_value,
-            requests,
-            payload,
-            block_access_list,
-            ..
-        } = context
-            .blockchain
-            .get_payload(payload_id)
-            .await
-            .map_err(|err| match err {
-                ChainError::UnknownPayload => {
-                    RpcErr::UnknownPayload(format!("Payload with id {payload_id:#018x} not found",))
-                }
-                err => RpcErr::Internal(err.to_string()),
-            })?;
-        (
-            blobs_bundle,
-            requests,
-            block_value,
-            payload,
-            block_access_list,
-        )
-    };
+    let result = context
+        .blockchain
+        .get_payload(payload_id)
+        .await
+        .map_err(|err| payload_retrieval_error(err, payload_id))?;
+    Ok(payload_bundle(result))
+}
 
-    let new_payload = PayloadBundle {
-        block,
-        block_value,
-        blobs_bundle,
-        requests,
-        block_access_list,
-    };
+fn payload_retrieval_error(err: ChainError, payload_id: u64) -> RpcErr {
+    match err {
+        ChainError::UnknownPayload => {
+            RpcErr::UnknownPayload(format!("Payload with id {payload_id:#018x} not found"))
+        }
+        err => RpcErr::Internal(err.to_string()),
+    }
+}
 
-    Ok(new_payload)
+fn payload_bundle(result: PayloadBuildResult) -> PayloadBundle {
+    PayloadBundle {
+        block: result.payload,
+        block_value: result.block_value,
+        blobs_bundle: result.blobs_bundle,
+        requests: result.requests,
+        block_access_list: result.block_access_list,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::{TestContext, default_context_with_storage};
+    use ethrex_common::types::BlockHeader;
     use ethrex_common::types::ChainConfig;
     use ethrex_rlp::encode::RLPEncode;
     use ethrex_storage::{EngineType, Store};

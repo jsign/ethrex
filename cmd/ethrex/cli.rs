@@ -14,6 +14,7 @@ use ethrex_blockchain::{
     DEFAULT_GAP_ADMIT_OCCUPANCY_THRESHOLD, DEFAULT_MAX_QUEUED_TXS_PER_ACCOUNT, DEFAULT_MIN_TIP_WEI,
     DEFAULT_PRICE_BUMP_PERCENT, L2Config,
     error::{ChainError, InvalidBlockError},
+    payload_witness::PayloadWitnessMode,
 };
 use ethrex_common::types::{Block, DEFAULT_BUILDER_GAS_CEIL, Genesis, validate_block_body};
 use ethrex_p2p::{
@@ -512,6 +513,15 @@ pub struct Options {
     )]
     pub max_blobs_per_block: Option<u32>,
     #[arg(
+        long = "builder.witness-mode",
+        default_value = "off",
+        value_name = "MODE",
+        help = "L1 payload witness assembly: off, eager, or on-demand (without re-execution)",
+        help_heading = "Block building options",
+        env = "ETHREX_BUILDER_WITNESS_MODE"
+    )]
+    pub builder_witness_mode: PayloadWitnessMode,
+    #[arg(
         long = "precompute-witnesses",
         action = ArgAction::SetTrue,
         default_value = "false",
@@ -640,6 +650,7 @@ impl Default for Options {
             gas_limit: DEFAULT_BUILDER_GAS_CEIL,
             max_blobs_per_block: None,
             precompute_witnesses: false,
+            builder_witness_mode: PayloadWitnessMode::Off,
             no_migrate: false,
             skip_genesis_validation: false,
             no_precompile_cache: false,
@@ -1420,6 +1431,50 @@ mod tests {
     use super::*;
     use clap::Parser;
     use ethrex_rpc::RpcNamespace;
+
+    #[test]
+    fn builder_witness_mode_parsing() {
+        let defaults = CLI::parse_from(["ethrex"]);
+        assert_eq!(defaults.opts.builder_witness_mode, PayloadWitnessMode::Off);
+        for (arg, expected) in [
+            ("off", PayloadWitnessMode::Off),
+            ("eager", PayloadWitnessMode::Eager),
+            ("on-demand", PayloadWitnessMode::OnDemand),
+        ] {
+            let cli = CLI::parse_from(["ethrex", "--builder.witness-mode", arg]);
+            assert_eq!(cli.opts.builder_witness_mode, expected);
+            assert!(!cli.opts.precompute_witnesses);
+        }
+        let cli = CLI::parse_from(["ethrex", "--precompute-witnesses"]);
+        assert_eq!(cli.opts.builder_witness_mode, PayloadWitnessMode::Off);
+        assert!(cli.opts.precompute_witnesses);
+        assert!(CLI::try_parse_from(["ethrex", "--builder.witness-mode=invalid"]).is_err());
+    }
+
+    #[test]
+    fn builder_witness_mode_environment() {
+        // Isolate environment changes in a subprocess: other CLI tests run in parallel.
+        if std::env::var_os("ETHREX_WITNESS_TEST_CHILD").is_some() {
+            assert_eq!(
+                CLI::parse_from(["ethrex"]).opts.builder_witness_mode,
+                PayloadWitnessMode::OnDemand
+            );
+            assert_eq!(
+                CLI::parse_from(["ethrex", "--builder.witness-mode=eager"])
+                    .opts
+                    .builder_witness_mode,
+                PayloadWitnessMode::Eager
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli::tests::builder_witness_mode_environment"])
+            .env("ETHREX_WITNESS_TEST_CHILD", "1")
+            .env("ETHREX_BUILDER_WITNESS_MODE", "on-demand")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     /// `--http.addr` must default to `127.0.0.1` so a fresh install on a public
     /// host is not exposed to the open internet.

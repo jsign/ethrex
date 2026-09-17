@@ -913,6 +913,7 @@ pub async fn init_l1(
             r#type: BlockchainType::L1,
             max_blobs_per_block: opts.max_blobs_per_block,
             precompute_witnesses: opts.precompute_witnesses,
+            builder_witness_mode: opts.builder_witness_mode,
             private_mempool: opts.mempool_private,
             precompile_cache_enabled: !opts.no_precompile_cache,
             min_tip_wei: opts.mempool_min_tip,

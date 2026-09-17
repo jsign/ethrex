@@ -199,6 +199,31 @@ impl RLPDecode for ExtWitness {
 }
 
 impl RpcExecutionWitness {
+    /// Encode the Engine API's opaque RLP ExtWitness representation.
+    pub fn encode_engine(self) -> Result<Bytes, RLPDecodeError> {
+        let mut headers = self
+            .headers
+            .iter()
+            .map(|header| BlockHeader::decode(header.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        headers.sort_by_key(|header| header.number);
+        let mut codes = self.codes;
+        codes.sort();
+        let mut state = self.state;
+        state.sort();
+        let mut keys = self.keys;
+        keys.sort();
+        Ok(Bytes::from(
+            ExtWitness {
+                headers,
+                codes,
+                state,
+                keys,
+            }
+            .encode_to_vec(),
+        ))
+    }
+
     /// Convert an RPC execution witness into the internal [`ExecutionWitness`]
     /// format by rebuilding trie structures from the flat node list.
     /// `decoded_headers` is reused (typically from [`decode_witness_headers`])

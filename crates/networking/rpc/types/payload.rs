@@ -387,6 +387,15 @@ pub struct ExecutionPayloadResponse {
     pub execution_requests: Option<Vec<EncodedRequests>>,
 }
 
+/// Ethrex extension of the V6 envelope. The witness is required on success.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionPayloadWithWitnessResponse {
+    #[serde(flatten)]
+    pub payload: ExecutionPayloadResponse,
+    #[serde(with = "serde_utils::bytes")]
+    pub witness: Bytes,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionPayloadResponseV2 {

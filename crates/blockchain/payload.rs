@@ -25,9 +25,11 @@ use ethrex_common::{
     },
 };
 
+use crate::payload_witness::{PayloadWitness, PayloadWitnessMode, WitnessInputs};
 use ethrex_crypto::NativeCrypto;
 use ethrex_crypto::keccak::Keccak256;
-use ethrex_vm::{Evm, EvmError, check_2d_gas_allowance, compute_burned_fees};
+use ethrex_vm::backends::levm::db::DatabaseLogger;
+use ethrex_vm::{DynVmDatabase, Evm, EvmError, check_2d_gas_allowance, compute_burned_fees};
 
 use ethrex_rlp::encode::RLPEncode;
 use ethrex_storage::{Store, error::StoreError};
@@ -38,6 +40,7 @@ use ethrex_metrics::metrics;
 use ethrex_metrics::blocks::METRICS_BLOCKS;
 #[cfg(feature = "metrics")]
 use ethrex_metrics::transactions::{METRICS_TX, MetricsTxType};
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -52,6 +55,9 @@ use crate::{
 use thiserror::Error;
 use tracing::{debug, warn};
 
+pub type SharedPayload = Arc<TokioMutex<PayloadOrTask>>;
+pub type PayloadCache = Arc<TokioMutex<Vec<(u64, SharedPayload)>>>;
+
 #[derive(Debug)]
 pub struct PayloadBuildTask {
     task: tokio::task::JoinHandle<Result<PayloadBuildResult, ChainError>>,
@@ -62,26 +68,13 @@ pub struct PayloadBuildTask {
 pub enum PayloadOrTask {
     Payload(Box<PayloadBuildResult>),
     Task(PayloadBuildTask),
+    Failed(String),
 }
 
-impl PayloadBuildTask {
-    /// Finishes the current payload build process and returns its result
-    pub async fn finish(self) -> Result<PayloadBuildResult, ChainError> {
+impl Drop for PayloadBuildTask {
+    fn drop(&mut self) {
         self.cancel.cancel();
-        self.task
-            .await
-            .map_err(|_| ChainError::Custom("Failed to join task".to_string()))?
-    }
-}
-
-impl PayloadOrTask {
-    /// Converts self into a `PayloadOrTask::Payload` by finishing the current build task
-    /// If self is already a `PayloadOrTask::Payload` this is a NoOp
-    pub async fn to_payload(self) -> Result<Self, ChainError> {
-        Ok(match self {
-            PayloadOrTask::Payload(_) => self,
-            PayloadOrTask::Task(task) => PayloadOrTask::Payload(Box::new(task.finish().await?)),
-        })
+        self.task.abort();
     }
 }
 
@@ -262,6 +255,8 @@ pub struct PayloadBuildContext {
     /// which carries no blob sidecars. Lets the blob path derive blob gas from the
     /// tx's versioned hashes instead of a mempool bundle.
     pub explicit_build: bool,
+    witness_logger: Option<Arc<DatabaseLogger>>,
+    witness_parent: BlockHeader,
 }
 
 impl PayloadBuildContext {
@@ -282,6 +277,16 @@ impl PayloadBuildContext {
         blockchain_type: &BlockchainType,
         block_hash_cache: BTreeMap<BlockNumber, BlockHash>,
     ) -> Result<Self, EvmError> {
+        Self::new_with_witness(payload, storage, blockchain_type, block_hash_cache, false)
+    }
+
+    fn new_with_witness(
+        payload: Block,
+        storage: &Store,
+        blockchain_type: &BlockchainType,
+        block_hash_cache: BTreeMap<BlockNumber, BlockHash>,
+        record_witness: bool,
+    ) -> Result<Self, EvmError> {
         let config = storage.get_chain_config();
         let base_fee_per_blob_gas = calculate_base_fee_per_blob_gas(
             payload.header.excess_blob_gas.unwrap_or_default(),
@@ -297,10 +302,18 @@ impl PayloadBuildContext {
             .ok_or_else(|| EvmError::DB("parent header not found".to_string()))?;
         let vm_db = StoreVmDatabase::new_with_block_hash_cache(
             storage.clone(),
-            parent_header,
+            parent_header.clone(),
             block_hash_cache,
         )?;
-        let mut vm = new_evm(blockchain_type, vm_db)?;
+        let (mut vm, witness_logger) = if record_witness {
+            let db: DynVmDatabase = Box::new(vm_db);
+            let logger = Arc::new(DatabaseLogger::new(Arc::new(db)));
+            let mut vm = Evm::new_from_db_for_l1(logger.clone(), Arc::new(NativeCrypto));
+            crate::attach_stateless_validator(&mut vm);
+            (vm, Some(logger))
+        } else {
+            (new_evm(blockchain_type, vm_db)?, None)
+        };
 
         // Enable BAL recording for Amsterdam and later forks (EIP-7928)
         if config.is_amsterdam_activated(payload.header.timestamp) {
@@ -339,6 +352,8 @@ impl PayloadBuildContext {
             payload_size,
             block_access_list: None,
             explicit_build: false,
+            witness_logger,
+            witness_parent: parent_header,
         })
     }
 
@@ -381,6 +396,7 @@ pub struct T8nRejectedTransaction {
 
 #[derive(Debug, Clone)]
 pub struct PayloadBuildResult {
+    pub witness: PayloadWitness,
     pub blobs_bundle: BlobsBundle,
     pub block_value: U256,
     pub receipts: Vec<Receipt>,
@@ -405,6 +421,7 @@ impl From<PayloadBuildContext> for PayloadBuildResult {
         } = value;
 
         Self {
+            witness: PayloadWitness::Disabled,
             blobs_bundle,
             block_value,
             requests: requests.unwrap_or_default(),
@@ -420,18 +437,30 @@ impl Blockchain {
     /// Attempts to fetch a payload given it's id. If the payload is still being built, it will be finished.
     /// Fails if there is no payload or active payload build task for the given id.
     pub async fn get_payload(&self, payload_id: u64) -> Result<PayloadBuildResult, ChainError> {
-        let mut payloads = self.payloads.lock().await;
-        // Find the given payload and finish the active build process if needed
-        let idx = payloads
-            .iter()
-            .position(|(id, _)| id == &payload_id)
-            .ok_or(ChainError::UnknownPayload)?;
-        let finished_payload = (payload_id, payloads.remove(idx).1.to_payload().await?);
-        payloads.insert(idx, finished_payload);
-        // Return the held payload
-        match &payloads[idx].1 {
+        let entry = {
+            let payloads = self.payloads.lock().await;
+            payloads
+                .iter()
+                .find(|(id, _)| *id == payload_id)
+                .map(|(_, entry)| entry.clone())
+                .ok_or(ChainError::UnknownPayload)?
+        };
+        // The handle stays in the entry while awaited. Dropping this future
+        // releases the lock, but another caller can still await the same task.
+        let mut entry = entry.lock().await;
+        if let PayloadOrTask::Task(task) = &mut *entry {
+            task.cancel.cancel();
+            let result = (&mut task.task).await;
+            *entry = match result {
+                Ok(Ok(payload)) => PayloadOrTask::Payload(Box::new(payload)),
+                Ok(Err(err)) => PayloadOrTask::Failed(err.to_string()),
+                Err(err) => PayloadOrTask::Failed(format!("Payload build task failed: {err}")),
+            };
+        }
+        match &*entry {
             PayloadOrTask::Payload(payload) => Ok(*payload.clone()),
-            _ => unreachable!("we already converted the payload into a finished version"),
+            PayloadOrTask::Failed(err) => Err(ChainError::Custom(err.clone())),
+            PayloadOrTask::Task(_) => unreachable!("build task has completed"),
         }
     }
 
@@ -457,10 +486,12 @@ impl Blockchain {
         }
         payloads.push((
             payload_id,
-            PayloadOrTask::Task(PayloadBuildTask {
-                task: payload_build_task,
-                cancel: cancel_token,
-            }),
+            Arc::new(tokio::sync::Mutex::new(PayloadOrTask::Task(
+                PayloadBuildTask {
+                    task: payload_build_task,
+                    cancel: cancel_token,
+                },
+            ))),
         ));
     }
 
@@ -478,7 +509,15 @@ impl Blockchain {
         // Snapshot the mempool sequence *before* the build so any tx that lands
         // during the build is seen as newer than the current `res`.
         let mut last_built_seq = self.mempool.tx_seq();
-        let mut res = self.build_payload(payload.clone())?;
+        let mut res = if self.options.builder_witness_mode != PayloadWitnessMode::Eager {
+            self.build_payload(payload.clone())?
+        } else {
+            let blockchain = self.clone();
+            let initial = payload.clone();
+            tokio::task::spawn_blocking(move || blockchain.build_payload(initial))
+                .await
+                .map_err(|err| ChainError::Custom(format!("Payload build task failed: {err}")))??
+        };
         while start.elapsed() < SECONDS_PER_SLOT && !cancel_token.is_cancelled() {
             // Wait for new transactions, cancellation, or slot deadline before rebuilding
             let remaining = SECONDS_PER_SLOT.saturating_sub(start.elapsed());
@@ -736,7 +775,18 @@ impl Blockchain {
 
         debug!("Building payload");
         let base_fee = payload.header.base_fee_per_gas.unwrap_or_default();
-        let mut context = PayloadBuildContext::new(payload, &self.storage, &self.options.r#type)?;
+        let mode = if matches!(self.options.r#type, BlockchainType::L1) {
+            self.options.builder_witness_mode
+        } else {
+            PayloadWitnessMode::Off
+        };
+        let mut context = PayloadBuildContext::new_with_witness(
+            payload,
+            &self.storage,
+            &self.options.r#type,
+            BTreeMap::new(),
+            mode != PayloadWitnessMode::Off,
+        )?;
 
         if let BlockchainType::L1 = self.options.r#type {
             self.apply_system_operations(&mut context)?;
@@ -788,7 +838,29 @@ impl Blockchain {
             }
         }
 
-        Ok(context.into())
+        let witness = if let Some(logger) = &context.witness_logger {
+            match logger.take_accesses() {
+                Ok(accesses) => {
+                    let inputs = WitnessInputs {
+                        block: context.payload.clone(),
+                        parent: context.witness_parent.clone(),
+                        account_updates: context.account_updates.clone(),
+                        accesses,
+                    };
+                    match mode {
+                        PayloadWitnessMode::Eager => PayloadWitness::Ready(inputs.assemble(self)),
+                        PayloadWitnessMode::OnDemand => PayloadWitness::pending(inputs),
+                        PayloadWitnessMode::Off => unreachable!("recording is enabled"),
+                    }
+                }
+                Err(err) => PayloadWitness::Ready(Err(err.to_string())),
+            }
+        } else {
+            PayloadWitness::Disabled
+        };
+        let mut result: PayloadBuildResult = context.into();
+        result.witness = witness;
+        Ok(result)
     }
 
     pub fn apply_withdrawals(&self, context: &mut PayloadBuildContext) -> Result<(), EvmError> {
@@ -1940,5 +2012,61 @@ mod tests {
             "L1GasReservationTooLow and IntrinsicGasTooLow must not share a Display \
              string, or the transient case becomes unclassifiable"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod retrieval_tests {
+    use super::*;
+    use ethrex_storage::EngineType;
+    use std::task::Poll;
+
+    fn candidate() -> PayloadBuildResult {
+        PayloadBuildResult {
+            witness: PayloadWitness::Ready(Ok(Bytes::from_static(b"candidate witness"))),
+            blobs_bundle: BlobsBundle::default(),
+            block_value: U256::zero(),
+            receipts: vec![],
+            requests: vec![],
+            account_updates: vec![],
+            payload: Block::default(),
+            block_access_list: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_payload_retrieval_preserves_shared_build_task() {
+        let blockchain =
+            Blockchain::default_with_store(Store::new("", EngineType::InMemory).unwrap());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let entry = Arc::new(tokio::sync::Mutex::new(PayloadOrTask::Task(
+            PayloadBuildTask {
+                task: tokio::spawn(async move { receive.await.unwrap() }),
+                cancel: cancel.clone(),
+            },
+        )));
+        blockchain.payloads.lock().await.push((1, entry));
+        {
+            let mut future = std::pin::pin!(blockchain.get_payload(1));
+            std::future::poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(cancel.is_cancelled());
+            assert!(
+                blockchain.payloads.try_lock().is_ok(),
+                "never hold global cache lock while waiting"
+            );
+        }
+        send.send(Ok(candidate())).unwrap();
+        let (a, b) = tokio::join!(blockchain.get_payload(1), blockchain.get_payload(1));
+        assert_eq!(a.unwrap().payload.hash(), b.unwrap().payload.hash());
+        assert!(matches!(
+            blockchain.get_payload(1).await.unwrap().witness,
+            PayloadWitness::Ready(Ok(_))
+        ));
     }
 }

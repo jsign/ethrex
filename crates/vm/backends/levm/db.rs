@@ -7,9 +7,17 @@ use ethrex_levm::db::Database as LevmDatabase;
 use crate::VmDatabase;
 use crate::db::DynVmDatabase;
 use ethrex_levm::errors::DatabaseError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::result::Result;
 use std::sync::{Arc, Mutex};
+
+/// Immutable, deduplicated database reads from one execution.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionAccesses {
+    pub block_hashes: HashMap<u64, CoreH256>,
+    pub state: HashMap<CoreAddress, Vec<CoreH256>>,
+    pub codes: Vec<CoreH256>,
+}
 
 #[derive(Clone)]
 pub struct DatabaseLogger {
@@ -20,6 +28,41 @@ pub struct DatabaseLogger {
 }
 
 impl DatabaseLogger {
+    /// Takes the recorded accesses, leaving the logger empty.
+    /// Call only after execution and all other database reads have finished.
+    pub fn take_accesses(&self) -> Result<ExecutionAccesses, DatabaseError> {
+        let (block_hashes, mut state, mut codes) = {
+            let mut block_hashes = self
+                .block_hashes_accessed
+                .lock()
+                .map_err(|_| DatabaseError::Custom("Could not take block hash accesses".into()))?;
+            let mut state = self
+                .state_accessed
+                .lock()
+                .map_err(|_| DatabaseError::Custom("Could not take state accesses".into()))?;
+            let mut codes = self
+                .code_accessed
+                .lock()
+                .map_err(|_| DatabaseError::Custom("Could not take code accesses".into()))?;
+            (
+                std::mem::take(&mut *block_hashes),
+                std::mem::take(&mut *state),
+                std::mem::take(&mut *codes),
+            )
+        };
+        for slots in state.values_mut() {
+            let mut seen = HashSet::new();
+            slots.retain(|slot| seen.insert(*slot));
+        }
+        let mut seen = HashSet::new();
+        codes.retain(|code| seen.insert(*code));
+        Ok(ExecutionAccesses {
+            block_hashes,
+            state,
+            codes,
+        })
+    }
+
     pub fn new(store: Arc<dyn LevmDatabase>) -> Self {
         Self {
             block_hashes_accessed: Arc::new(Mutex::new(HashMap::new())),

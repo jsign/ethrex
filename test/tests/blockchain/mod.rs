@@ -16,6 +16,7 @@ mod mempool_tests;
 mod merkle_pool_tests;
 mod payload_build_loop_tests;
 mod payload_tests;
+mod payload_witness_tests;
 mod sampling_tests;
 mod smoke_tests;
 mod storage_sharding_tests;
